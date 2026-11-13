@@ -175,6 +175,19 @@
   `ff2c55e`). `a50-build-shim.py` в форке собирает `xnu_boot.Image`
   побайтно таким же, как проверенный на телефоне. Сейчас в BOOT телефона
   стоит тест загрузчика (`loadertest1`), а не probe.
+- Ядро: локально собрано дерево `xnu-8796.141.3` + патчи форка (LF, как в
+  облаке): 254 из 256 ложатся (`0031`, `0041` ждут HFS от `0026-stage-hfs.sh`).
+  В патчах S7 больше 50 фиксированных адресов Exynos 8890 (CMU, PMU, GPIO,
+  HSI2C, DECON, Mali, аудио, PCIe Wi-Fi, TMU). Все вызовы драйверов S7 из
+  общего кода: `IOKitBSDInit.cpp` (кнопки, тач, GPU, UFS), личности
+  `SweetBattery`/`HeroGPU`, `bsd_init.c` (drop zone, Wi-Fi),
+  `SweetFramebuffer.cpp` (DECON vsync, Mali present — только при
+  `hfb_state`/boot-args). Потоки драйверов стартуют только из этих мест.
+- `xnu/patches/0400-a50-board-target.patch`: `MACHINE_CONFIG=A50` (HEROLTE +
+  `ARM64_BOARD_CONFIG_A50`), эти вызовы отключены для A50, константы экрана
+  и MPIDR A50; `0019`/`0020`/`0026` и `xnu.yml` знают A50 (пуш в `a50` →
+  `kernel.development.a50`). На LF-дереве накладывается чисто. Компиляция
+  ещё не проверена.
 - По решению пользователя probe оставлен в BOOT: Android не грузится,
   каждое включение — экран probe → TWRP. Стоковый BOOT для возврата:
   `E:\iOS-A50\backup\2026-11-13\boot.img` через `tools/a50-adb-boot.ps1`.

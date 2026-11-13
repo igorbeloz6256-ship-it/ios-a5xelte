@@ -134,6 +134,38 @@ powershell -File tools/a50-adb-boot.ps1 -Image loadertest-boot.img   # из TWRP
 `ENTRY 0000000090004000`, `BOOTARGS 0000000090009000`, `JUMP TO XNU`, ниже
 блок `PAYLOAD TEST 1: RUNNING` … `ALL CHECKS PASSED` и отсчёт.
 
+## Этап 3: ядро XNU для A50 (`MACHINE_CONFIG=A50`)
+
+`xnu/patches/0400-a50-board-target.patch` (после всей серии herolte):
+
+- A50 собирается как вариант HEROLTE: флаги `-DARM64_BOARD_CONFIG_A5XELTE
+  -DARM64_BOARD_CONFIG_HEROLTE -DARM64_BOARD_CONFIG_A50`. Так остаются общие
+  исправления порта S7 (4 КиБ страницы, pmap, банки RAM, планировщик,
+  ранняя консоль), а драйверы железа S7 на A50 **не запускаются**:
+  - `IOKitBSDInit.cpp`: без кнопок, тача, GPU-пробы, UFS и eMMC (все —
+    фиксированные адреса Exynos 7580/8890);
+  - `KernelConfigTables.cpp`: без `SweetBattery` и `HeroGPU`;
+  - `bsd_init.c`: без drop zone и Wi-Fi;
+  - `SweetFramebuffer.cpp`: без ожидания vsync по DECON S7 (`0x13960000`).
+  Сами файлы драйверов S7 компилируются (чтобы не ломать связи), но их
+  код без этих вызовов не выполняется: все их потоки стартуют только оттуда.
+- `A5XELTE.h`: экран `0xca000000` 1080×2340, шаг 4320, 5 блоков по 2 МиБ,
+  текст ×2, метка `0x8ffff100`, стартовое ядро MPIDR `0x0`, 1 CPU.
+- `MakeInc.def`, `Makefile.template` (bsd, libkern), `MASTER.arm64.a50`:
+  A50 рядом с HEROLTE (arm64 без PAC, компактная раскладка VA).
+- Скрипты `0019`/`0020`/`0026` (pthread, BearSSL, HFS) и `xnu.yml` знают
+  `A50`; пуш в ветку `a50` собирает `kernel.development.a50`.
+
+Проверено локально: серия из 256 патчей на `xnu-8796.141.3` (как в сборке,
+LF) + `0400` накладывается без ошибок (`0031`/`0041` требуют HFS из
+`0026-stage-hfs.sh`, в облаке он есть). Компиляция — только в Actions.
+
+Первая цель на телефоне: цветные метки и текст XNU на экране A50 (вход,
+MMU, FP, tunables, `arm_init`), потом ранняя консоль. Дальше ядро, скорее
+всего, остановится на поиске корневого раздела — драйвера UFS для A50 ещё
+нет. Нужно ещё дерево устройств Apple (ADT) с железом A50: `mkadt_a50.py`
+по образцу `tools/mkadt_herolte.py`.
+
 ## Правила безопасности
 
 - Пишем **только BOOT**. EFS (IMEI), RECOVERY, загрузчики (BOTA/SBOOT),
