@@ -1,0 +1,280 @@
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index a591abc..6b2f98b 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -57,11 +57,27 @@ extern int hz;
+ #define REG_UTRLCLR     0x5c
+ #define REG_UTRLRSR     0x60
+ #define REG_VER         0x08
++#if defined(ARM64_BOARD_CONFIG_A50)
++/*
++ * Galaxy A50, Exynos 9610 (exynos9610.dts ufs@0x13520000): the vendor HCI
++ * block is reg 1 at 0x13521100, 0x1100 above the standard one (ufs-exynos.h
++ * offsets: TXPRDT 0x00, RXPRDT 0x04, UTRL_NEXUS_TYPE 0x40). UNIPRO and the
++ * UFS protector (FMP) are separate blocks and stay untouched.
++ */
++#define UFS_VS_BASE             0x1100
++#define HEROLTE_UFS_MAP         0x2000
++#define UFS_DT_NODE             "/a50-ufs"
++#define UFS_ROOT_DEFAULT        "userdata"      /* A50 GPT names are lower case */
++#else
+ /* Exynos vendor HCI registers, 0x100 above the standard block. */
+-#define VS_TXPRDT_ENTRY_SIZE    0x100
+-#define VS_RXPRDT_ENTRY_SIZE    0x104
+-#define VS_UTRL_NEXUS_TYPE      0x140
++#define UFS_VS_BASE             0x100
+ #define HEROLTE_UFS_MAP         0x300
++#define UFS_DT_NODE             "/herolte-ufs"
++#define UFS_ROOT_DEFAULT        "USERDATA"
++#endif
++#define VS_TXPRDT_ENTRY_SIZE    (UFS_VS_BASE + 0x00)
++#define VS_RXPRDT_ENTRY_SIZE    (UFS_VS_BASE + 0x04)
++#define VS_UTRL_NEXUS_TYPE      (UFS_VS_BASE + 0x40)
+ 
+ #define HCS_DP          (1u << 0)
+ #define HCS_UTRLRDY     (1u << 1)
+@@ -82,19 +98,39 @@ struct utrd {
+ 	uint32_t prdt;          /* [31:16] PRDT offset, [15:0] PRDT length, BYTES */
+ };
+ 
++struct prdt_entry {
++	uint32_t addr_lo, addr_hi, rsvd, dbc;
++};
++
++/*
++ * PRDT entries are 16 bytes in UFSHCI. Samsung's FMP (inline crypto) makes
++ * them 128 bytes (ufshci.h struct ufshcd_sg_entry with
++ * CONFIG_SCSI_UFS_EXYNOS_FMP: des4..des31 hold IVs and keys), and which one
++ * the host walks depends on how the bootloader left FMP. The A50 measures it
++ * (ufs_detect_prdt_stride); HEROLTE keeps 16.
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#define PRDT_STRIDE_MAX 128u
++#else
++#define PRDT_STRIDE_MAX 16u
++#endif
++
+ struct ucd {
+ 	uint8_t cmd[512];
+ 	uint8_t resp[512];
+-	struct {
+-		uint32_t addr_lo, addr_hi, rsvd, dbc;
+-	} prdt[PRDT_MAX];
++	uint8_t prdt[PRDT_MAX * PRDT_STRIDE_MAX];
+ };
+ 
+ /* Layout of the contiguous DMA allocation. */
+ #define DMA_UTRL        0x0000                  /* 1 KiB aligned */
+-#define DMA_UCD         0x1000                  /* 128 byte aligned, 5 KiB */
++#define DMA_UCD         0x1000                  /* 128 byte aligned */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#define DMA_BOUNCE      0x10000                 /* after 33 KiB of UCD */
++#else
+ #define DMA_BOUNCE      0x4000
++#endif
+ #define DMA_SIZE        (DMA_BOUNCE + BOUNCE_SIZE)
++_Static_assert(DMA_UCD + sizeof(struct ucd) <= DMA_BOUNCE, "UCD overlaps the bounce buffer");
+ 
+ static struct {
+ 	vm_offset_t regs;
+@@ -105,6 +141,8 @@ static struct {
+ 	uint8_t tag;
+ 	uint64_t first_block, nblocks;          /* partition, in 4 KiB device blocks */
+ 	uint32_t secsize;                       /* logical sector size for the BSD layer */
++	uint32_t prdt_stride;                   /* bytes per PRDT entry the host walks */
++	bool prdt_probe;                        /* next command: ufs_detect_prdt_stride's PRDT */
+ 	bool writable;                          /* boot-arg ufsrw=1 */
+ 	bool cache;                             /* boot-arg ufscache=1 */
+ 	bool wait;                              /* boot-arg ufswait=1 */
+@@ -171,15 +209,34 @@ ufs_scsi(const uint8_t *cdb, unsigned cdb_len, uint32_t len, bool write)
+ 	utrd->ucdba = (uint32_t)ucd_pa;
+ 	utrd->ucdbau = (uint32_t)(ucd_pa >> 32);
+ 	utrd->resp = 512u << 16 | 512u;
+-	if (len) {
+-		uint32_t n = 0;
++	if (len && su.prdt_probe) {
++		/*
++		 * ufs_detect_prdt_stride: a two-block read whose second entry sits at
++		 * BOTH byte 16 (-> bounce + 4 KiB) and byte 128 (-> bounce + 8 KiB);
++		 * every other 16-byte slot of the 256 points at bounce + 12 KiB.
++		 * Length 256 bytes is two 128-byte entries or sixteen 16-byte ones:
++		 * whichever the host walks, all DMA stays inside the bounce buffer.
++		 * des3 holds only the byte count, so FMP crypto stays off.
++		 */
++		for (uint32_t off = 0; off < 256u; off += 16u) {
++			struct prdt_entry *pe = (struct prdt_entry *)(void *)(ucd->prdt + off);
++			uint64_t pa = bounce_pa + (off == 0 ? 0 : off == 16u ? UFS_BLOCK :
++			    off == 128u ? 2 * UFS_BLOCK : 3 * UFS_BLOCK);
++			pe->addr_lo = (uint32_t)pa;
++			pe->addr_hi = (uint32_t)(pa >> 32);
++			pe->dbc = UFS_BLOCK - 1;
++		}
++		utrd->prdt = 1024u << 16 | 256u;
++	} else if (len) {
++		uint32_t n = 0, stride = su.prdt_stride ? su.prdt_stride : 16u;
+ 		for (uint32_t done = 0; done < len; done += PRDT_CHUNK, n++) {
+ 			uint32_t chunk = MIN(PRDT_CHUNK, len - done);
+-			ucd->prdt[n].addr_lo = (uint32_t)(bounce_pa + done);
+-			ucd->prdt[n].addr_hi = (uint32_t)((bounce_pa + done) >> 32);
+-			ucd->prdt[n].dbc = chunk - 1;
++			struct prdt_entry *pe = (struct prdt_entry *)(void *)(ucd->prdt + n * stride);
++			pe->addr_lo = (uint32_t)(bounce_pa + done);
++			pe->addr_hi = (uint32_t)((bounce_pa + done) >> 32);
++			pe->dbc = chunk - 1;
+ 		}
+-		utrd->prdt = 1024u << 16 | (n * (uint32_t)sizeof(ucd->prdt[0]));
++		utrd->prdt = 1024u << 16 | (n * stride);
+ 	}
+ 
+ 	if (su.cache) {
+@@ -306,6 +363,66 @@ ufs_sync_cache(void)
+ 	return ufs_scsi(cdb, sizeof(cdb), 0, false);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A50)
++static bool
++all_bytes(const uint8_t *p, uint8_t v, uint32_t n)
++{
++	for (uint32_t i = 0; i < n; i++) {
++		if (p[i] != v) {
++			return false;
++		}
++	}
++	return true;
++}
++#endif
++
++/*
++ * How many bytes per PRDT entry the host walks (16, or 128 with Samsung FMP
++ * descriptors), measured with one READ(10) of LBA 1-2 (GPT header and the
++ * first entries) through the dual-placement PRDT in ufs_scsi. Read only.
++ * Must run before any multi-block transfer. HEROLTE keeps 16.
++ */
++static int
++ufs_detect_prdt_stride(void)
++{
++#if defined(ARM64_BOARD_CONFIG_A50)
++	uint8_t *b = (uint8_t *)(su.dma + DMA_BOUNCE);
++	static const uint8_t cdb[10] = { 0x28, 0, 0, 0, 0, 1, 0, 0, 2, 0 };
++
++	memset(b, 0x5a, 4 * UFS_BLOCK);
++	dma_sync(DMA_BOUNCE, 4 * UFS_BLOCK);
++	su.prdt_probe = true;
++	int error = ufs_scsi(cdb, sizeof(cdb), 2 * UFS_BLOCK, false);
++	su.prdt_probe = false;
++	dma_sync(DMA_BOUNCE, 4 * UFS_BLOCK);
++	if (error) {
++		printf("HEROLTE UFS: PRDT stride probe: READ(10) failed %d\n", error);
++		return error;
++	}
++	bool gpt = memcmp(b, "EFI PART", 8) == 0;
++	bool at16 = !all_bytes(b + UFS_BLOCK, 0x5a, UFS_BLOCK);
++	bool at128 = !all_bytes(b + 2 * UFS_BLOCK, 0x5a, UFS_BLOCK);
++	bool spare = !all_bytes(b + 3 * UFS_BLOCK, 0x5a, UFS_BLOCK);
++	printf("HEROLTE UFS: PRDT stride probe: LBA1 %.8s, 16-byte slot %s, 128-byte slot %s, spare %s\n",
++	    gpt ? (const char *)b : "not GPT", at16 ? "filled" : "empty",
++	    at128 ? "filled" : "empty", spare ? "filled" : "empty");
++	if (!gpt) {
++		return ENXIO;
++	}
++	if (at16 && !at128 && !spare) {
++		su.prdt_stride = 16;
++	} else if (at128 && !at16 && !spare) {
++		su.prdt_stride = 128;
++	} else {
++		return EIO;
++	}
++	printf("HEROLTE UFS: host walks %u-byte PRDT entries\n", su.prdt_stride);
++#else
++	su.prdt_stride = 16;
++#endif
++	return 0;
++}
++
+ static int
+ ufs_find_partition(const char *want)
+ {
+@@ -748,10 +865,10 @@ herolte_ufs_init(void)
+ 	DTEntry node;
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+-	char want[64] = "USERDATA";
++	char want[64] = UFS_ROOT_DEFAULT;
+ 	int error;
+ 
+-	if (SecureDTLookupEntry(NULL, "/herolte-ufs", &node) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, UFS_DT_NODE, &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+ 		printf("HEROLTE UFS: no /herolte-ufs node in the device tree\n");
+@@ -791,6 +908,9 @@ herolte_ufs_init(void)
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
++	if (!error) {
++		error = ufs_detect_prdt_stride();
++	}
+ 	if (!error) {
+ 		error = ufs_find_partition(want);
+ 	}
+@@ -830,10 +950,10 @@ herolte_ufs_probe(void)
+ 	uintptr_t const *reg = NULL;
+ 	unsigned int size = 0;
+ 
+-	if (SecureDTLookupEntry(NULL, "/herolte-ufs", &node) != kSuccess ||
++	if (SecureDTLookupEntry(NULL, UFS_DT_NODE, &node) != kSuccess ||
+ 	    SecureDTGetProperty(node, "reg", (void const **)&reg, &size) != kSuccess ||
+ 	    size < 2 * sizeof(uintptr_t)) {
+-		printf("HEROLTE UFS: probe: no /herolte-ufs node\n");
++		printf("HEROLTE UFS: probe: no %s node\n", UFS_DT_NODE);
+ 		return;
+ 	}
+ 	if (!su.regs) {
+@@ -869,6 +989,10 @@ herolte_ufs_probe(void)
+ 		su.lun = 0;
+ 	}
+ 	const uint8_t *b = (const uint8_t *)(su.dma + DMA_BOUNCE);
++	if (!error) {
++		/* Before any multi-block read (the GPT entries below). */
++		error = ufs_detect_prdt_stride();
++	}
+ 	if (!error) {
+ 		error = ufs_read_blocks(1, 1);
+ 		printf("HEROLTE UFS: probe: READ(10) LBA1 %d, signature %.8s\n", error,
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 5e632e0..0db33a0 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -776,7 +776,32 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	 * Galaxy A50 (Exynos 9610): every driver below is Exynos 7580 or 8890
+ 	 * hardware at fixed physical addresses that belong to other blocks on
+ 	 * the 9610. None of them may run here; A50 drivers come later.
++	 *
++	 * The exception is bsd/dev/herolte_ufs.c, which reads its registers
++	 * from the device tree (/a50-ufs, Exynos 9610 layout): ufsprobe=1 only
++	 * reads (host state, LUN 0 GPT); rd=ufsroot0 serves the GPT partition
++	 * ufsroot= (default "userdata"), read only unless ufsrw=1.
+ 	 */
++	{
++	uint32_t ufsprobe = 0;
++	PE_parse_boot_argn("ufsprobe", &ufsprobe, sizeof(ufsprobe));
++	if (ufsprobe == 1) {
++		extern void herolte_ufs_probe(void);
++		herolte_ufs_probe();
++	}
++	}
++	if (strcmp(rdBootVar, "ufsroot0") == 0) {
++		extern int herolte_ufs_rootdev(dev_t *dev);
++		OSSafeReleaseNULL(matching);
++		int ufs_error = herolte_ufs_rootdev(root);
++		if (ufs_error) {
++			panic("IOFindBSDRoot: A50 UFS root %s unavailable: %d", rdBootVar, ufs_error);
++		}
++		strlcpy(rootName, rdBootVar, rootNameSize);
++		IOLog("BSD root: %s, major %d, minor %d\n", rootName, major(*root), minor(*root));
++		*oflags = 0;
++		goto iofrootx;
++	}
+ #elif defined(ARM64_BOARD_CONFIG_A5XELTE)
+ 	/* GPIO keys: Exynos 7580 or, on HEROLTE, the Exynos 8890 ALIVE pins. */
+ 	a5xelte_keys_init();

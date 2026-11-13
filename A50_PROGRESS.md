@@ -186,8 +186,91 @@
 - `xnu/patches/0400-a50-board-target.patch`: `MACHINE_CONFIG=A50` (HEROLTE +
   `ARM64_BOARD_CONFIG_A50`), эти вызовы отключены для A50, константы экрана
   и MPIDR A50; `0019`/`0020`/`0026` и `xnu.yml` знают A50 (пуш в `a50` →
-  `kernel.development.a50`). На LF-дереве накладывается чисто. Компиляция
-  ещё не проверена.
+  `kernel.development.a50`). На LF-дереве накладывается чисто.
+- Коммит `0f10725` отправлен, Actions `xnu` (run 43437740240,
+  macos-15-intel) запустился в 13:54 UTC.
+- Run 43437740240 — **success** (13:54–14:08 UTC): все шаги зелёные, в т.ч.
+  проверка на LSE (она идёт только по существующему
+  `kernel.development.a50`). Артефакты: `xnu-kernel-macos-15-intel`
+  (62,7 МБ zip), `xnu-buildtree-macos-15-intel`. Значит, патч `0400`
+  компилируется с первого раза.
+- Пользователь скачал артефакт; `kernel.development.a50` 17402752 байта,
+  SHA256SUMS из артефакта совпал. Mach-O arm64 (cputype 0x100000c, не
+  arm64e), без chained fixups, вход `0xfffffff00743d488`, `__TEXT` с
+  `0xfffffff007004000`, конец ядра `0xfffffff008528000`.
+- `E:\iOS-A50\flash\xnu1\`: `a50.adt` (4264 байта, без `/product`),
+  `payload.bin` (16769056 байт, cmdline `debug=0xc serial=3 cpus=1
+  keepsyms=1 -enable_kprintf_spam -noprogress`), `boot.img` (16789520 байт,
+  sha256 `08964e35…aa48`). Хост-прогон проверок загрузчика: нагрузка
+  `0x80244000..0x81253000` (ниже EL2_CODE), 10 сегментов в
+  `0x91004000..0x92528000`, вход `0x9143d488`, ADT `0x92528000`, boot_args
+  `0x9252a000` — всё проходит.
+
+### Первый запуск XNU на A50 (19:15)
+
+- `xnu1\boot.img` записан в BOOT (чтение обратно совпало), `adb reboot` в
+  19:15:26. **XNU загрузился до ожидания корневого раздела.** Цветных
+  блоков пользователь не заметил (их сразу перекрывает консоль), но ранняя
+  консоль ядра на экране A50 работает: два фото, строки (с фото):
+  - `SWEET FB: AppleCLCD 1080x2340 stride 4320 at 0xca000000, default
+    surface 1, presented as 1125x2436`; `A5XELTE FB: requested 30 Hz,
+    effective 30 Hz`; `parallel copy with 3 helper threads`;
+  - `zone_init: map GEN3 … DATA … metadata …`, `VM bootstrap done`,
+    `IOKit IOMD setownership ENABLED`, `Scheduler: Default of clutch`,
+    `Scheduler: SWEET fast cores 0xf0`, `IPC_PTHREAD_PRIORITY subsystem`;
+  - `debug_log_init: Error!! gPanicBase is still not initialized` (ожидаемо:
+    PLATFORM_PANIC_LOG_DISABLED), `Initializing serial KDP`, `iBoot version:
+    a50-entry`;
+  - `SWEET PRNG: HMAC-SHA256 registered`, `A5XELTE pthread:
+    libpthread-514.100.2 registered`, `SWEET AMFI`, `vnguard`, `SWEET:
+    trust caches unavailable`, `A5XELTE: starting device-tree platform
+    expert`, `SWEET AKS`, `SWEET WDT`, `SWEET SURF`, `SWEET HID: buttons /
+    touch registered`;
+  - `ml_processor_register … cluster_id 0 cpu_number 0 is type 0`,
+    `A5XELTE CPU: requested=1 selected=1 (limit=1)`, `cpu=0 entered initCPU
+    mpidr=0x0 EL1 IRQs=1`, `cpu=0 mpidr=0x0 came alive; SGI1 OK`, `1/1 CPUs
+    initialized, SGI1 verified`, `timer test cpu=0 woke on 0 after 21070 us`
+    — **GIC-400 по 0x12301000/0x12302000 и виртуальный таймер (INTID 27)
+    работают под uH**;
+  - `MAC Framework successfully initialized`, `SWEET HFS: hfs-627.100.6
+    registered`, `mcache: 1 CPU(s)`, `mbinit: done (64 MB total pool size)`,
+    `DLIL: running SUM16 self-tests … PASSED`, `Skywalk: running
+    self-tests` — все `PASSED`, `bsd_autoconf: calling kminit`,
+    `ifnet_attach` lo0/gif0/stf0;
+  - последняя строка: `Waiting on <dict ID="0"><key>IOProviderClass</key>
+    <string ID="1">IOMedia</string><key>Content</key><string
+    ID="2">Apple_HFS</string></dict>` — ядро ждёт корневой раздел HFS
+    (драйвера UFS для A50 нет, и так и задумано).
+- Пользователь перезагрузил телефон кнопками; в 19:18:54 TWRP снова по
+  adb. USB под XNU не появлялся (драйвера нет). `/dev/mem` в TWRP нет —
+  страницу меток `0x8ffff000` прочитать нельзя.
+- Следующее: драйвер UFS для Exynos 9610 (`0x13520000`, по образцу
+  `bsd/dev/herolte_ufs.c`), затем корень iOS в USERDATA.
+
+### UFS для A50 (патч 0401)
+
+- Отличия 9610 от 8890 по DTS и исходникам ядра A50 (FreshROMs,
+  `ufs-exynos.h`, `ufshci.h`, `ufs-exynos.c`): вендорский блок HCI — reg 1
+  `0x13521100` (`+0x1100`, у 8890 `+0x100`), смещения в нём те же (TXPRDT
+  0x00, RXPRDT 0x04, UTRL_NEXUS_TYPE 0x40); квирки `PRDT_BYTE_GRAN`,
+  `BROKEN_REQ_LIST_CLR`; с `CONFIG_SCSI_UFS_EXYNOS_FMP` запись PRDT —
+  128 байт (des4..des31 — IV и ключи FMP), без него — 16. Как загрузчик
+  оставил FMP, заранее неизвестно.
+- `xnu/patches/0401-a50-ufs.patch`: `herolte_ufs.c` для A50 — узел ADT
+  `/a50-ufs` (`0x13520000`, карта 0x2000), смещение вендорских регистров
+  `0x1100`, раздел по умолчанию `userdata`, шаг PRDT 16/128. Шаг
+  измеряется одним чтением LBA 1–2: вторая запись лежит и на байте 16
+  (→ буфер +4 КиБ), и на байте 128 (→ +8 КиБ), остальные слоты → +12 КиБ,
+  длина 256 байт — DMA при любом шаге остаётся в своём буфере, по
+  заполненному слоту видно шаг. Без успешного измерения дальше не читает.
+  Для S7 поведение то же (шаг 16, раскладка DMA прежняя). `IOKitBSDInit`
+  для A50 вызывает только UFS (`ufsprobe=1` — только чтение; `rd=ufsroot0`).
+- `mkadt_a50.py`: узел `a50-ufs` reg `0x13520000`+`0x2000`.
+- На LF-дереве `0400`+`0401` накладываются чисто; компиляция — в Actions.
+
+- `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
+  проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon
+  `0xca000000`+`0x9a3f80`, RAM `0x90000000`+512 МиБ, один CPU с MPIDR 0.
 - По решению пользователя probe оставлен в BOOT: Android не грузится,
   каждое включение — экран probe → TWRP. Стоковый BOOT для возврата:
   `E:\iOS-A50\backup\2026-11-13\boot.img` через `tools/a50-adb-boot.ps1`.

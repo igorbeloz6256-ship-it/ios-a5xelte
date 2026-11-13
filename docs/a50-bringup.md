@@ -163,8 +163,33 @@ LF) + `0400` накладывается без ошибок (`0031`/`0041` тр�
 Первая цель на телефоне: цветные метки и текст XNU на экране A50 (вход,
 MMU, FP, tunables, `arm_init`), потом ранняя консоль. Дальше ядро, скорее
 всего, остановится на поиске корневого раздела — драйвера UFS для A50 ещё
-нет. Нужно ещё дерево устройств Apple (ADT) с железом A50: `mkadt_a50.py`
-по образцу `tools/mkadt_herolte.py`.
+нет.
+
+Дерево устройств Apple (ADT) с железом A50 — `tools/mkadt_a50.py` (по
+образцу `mkadt_herolte.py`): RAM `0x90000000`+512 МиБ (окно, проверенное
+загрузчиком), один CPU Cortex-A53 с MPIDR `0x0`, GIC-400 `0x12301000` /
+`0x12302000`, виртуальный таймер INTID 27, 26 МГц, экран `0xca000000`
+1080×2340 (`a5xelte-fbcon` для консоли и `disp0` для AppleCLCD). Файлы
+Apple для ядра не нужны: `/product` из `research/ipsw-x/d22ap.adt`
+добавляется, только если он есть (он нужен позже, для SpringBoard).
+
+Когда Actions соберёт ядро (артефакт `xnu-kernel-macos-15-intel`,
+`kernel.development.a50`):
+
+```sh
+python tools/mkadt_a50.py a50.adt
+python tools/mkpayload.py kernel.development.a50 a50.adt payload.bin \
+    --cmdline 'debug=0xc serial=3 cpus=1 keepsyms=1 -enable_kprintf_spam -noprogress'
+python tools/a50-pack-boot.py pack boot-stock.img shim/a50/out/xnu_boot.Image \
+    xnu-boot.img --append payload.bin --partition-size 57671680
+powershell -File tools/a50-adb-boot.ps1 -Image xnu-boot.img   # из TWRP
+```
+
+Ожидается: строки загрузчика до `JUMP TO XNU`, потом цветные блоки XNU
+(зелёный — вход, синий — MMU, голубой — FP, фиолетовый — tunables,
+жёлтый — `arm_init`) и текст ранней консоли. Если экран застыл — фото, затем
+Vol− + Power ~7 с и сразу Vol+ + Power (TWRP); метки XNU остаются в
+странице `0x8ffff000`.
 
 ## Правила безопасности
 
