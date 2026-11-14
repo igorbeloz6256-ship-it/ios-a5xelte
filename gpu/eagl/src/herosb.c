@@ -5,6 +5,7 @@
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
+#include <fcntl.h>
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
@@ -108,12 +109,40 @@ says_yes(id self, SEL cmd)
  * ...but told type 2, UIKit in SpringBoard asks each provider class in turn, none takes a 750x1334 screen and it ends on
  * the red rdar:45025538 fallback. The plain phone's class takes any screen here, and is put in where the fallback
  * still reaches the status bar.
+ *
+ * DROP_DIR statusbar.provider (one line, a class name) picks another one: the Galaxy A50 (1080x2340 at @3x, 360x780
+ * points, no iPhone has it) has a camera hole in the middle of the top edge, where the plain phone's clock would be,
+ * so it asks for an iPhone X style split one. A name that is not a class here keeps the plain phone's.
  */
+static Class
+chosen_provider(void)
+{
+   static Class chosen;
+   if (chosen)
+      return chosen;
+   chosen = objc_getClass("_UIStatusBarVisualProvider_Phone");
+   char name[96] = { 0 };
+   int fd = open(DROP_DIR "statusbar.provider", O_RDONLY);
+   if (fd >= 0) {
+      ssize_t n = read(fd, name, sizeof(name) - 1);
+      close(fd);
+      for (ssize_t i = 0; i < n; i++) {
+         if (name[i] == '\n' || name[i] == '\r' || name[i] == ' ')
+            name[i] = '\0';
+      }
+      Class wanted = n > 0 ? objc_getClass(name) : Nil;
+      herodrm_log("herosb: status bar provider %s %s", name, wanted ? "found" : "NOT found, plain phone's");
+      if (wanted)
+         chosen = wanted;
+   }
+   return chosen;
+}
+
 static Class
 phone_takes_it(id self, SEL cmd, id screen, id info)
 {
    status_bar_asked++;
-   return objc_getClass("_UIStatusBarVisualProvider_Phone");
+   return chosen_provider();
 }
 
 static void (*set_provider_was)(id, SEL, Class);
@@ -123,7 +152,7 @@ set_provider(id self, SEL cmd, Class provider)
 {
    if (provider == objc_getClass("_UIStatusBarVisualProvider_Fallback")) {
       status_bar_replaced++;
-      provider = objc_getClass("_UIStatusBarVisualProvider_Phone");
+      provider = chosen_provider();
    }
    set_provider_was(self, cmd, provider);
 }

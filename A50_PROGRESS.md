@@ -519,6 +519,48 @@
   событий каждые 10 мс → `sweet_hid_touch` в пикселях 1080×2340
   (`a50touch=0` выключает). `SweetHID.cpp`: для A50 панель 1080×2340,
   68×148 мм. На LF-дереве ложится поверх 0403.
+- Коммит `6de2d64`, сборка 43624194287 — **success, без ошибок компиляции**.
+  `xnu11`: ядро 17337760 байт (SHA256SUMS OK, строка `A50 TOUCH: polling`
+  внутри), ADT и cmdline как xnu10; `boot.img` sha256 `21c4db72…6962`,
+  хост-прогон проходит.
+- xnu11 на телефоне (21:24): **тач работает «практически идеально»**
+  (пользователь: разблокировка свайпом, рабочий стол, иконки). Журнал
+  `boot-xnu11.txt`: `before: gpg3 con=0 dat=0x1c` (питание тача после
+  S-Boot выключено), `gpp1 con=0`, `i2c con=0xa`; `power switched on; after:
+  gpg3 con=0x10 dat=0x1e gpp1 con=0x22`; `ready status read 0x5`, **`product
+  "2019-A50"`**, `resolution 4095 x 4095`, `versions … core 0301 custom 1130
+  param 2702`; 32 касания (`finger 0 down/up at x,y`), 1 ошибка I2C.
+- Строка состояния на экране блокировки была оранжево-красной полосой: это
+  отладочная полоса UIKit rdar:45025538 («No status bar visual provider»),
+  как у S7 при не-айфонном размере. 1080×2340 @3x = 360×780 точек = экран
+  **iPhone 12 mini** (artwork-device-subtype 2340). `mkadt_a50.py`: в
+  `/product` `artwork-device-subtype` 2340 (опция `--subtype`), scale 3.
+  `xnu12\boot.img` (ядро xnu11, sha256 `8e487650…507d`) — проверка;
+  записан, reboot 21:59:53.
+- Обои (как у S7): `libherosb.dylib` (gpu/eagl/src/herosb.c, артефакт
+  workflow `mesa-ios`) с boot-arg `herosb=1` встраивается в SpringBoard
+  (`herolte_gl.c`) и ставит `/private/var/herolte/wallpaper.png` в окна обоев и
+  за рабочий стол; файлы приходят через drop zone (`herolte_drop.c`, 128 МиБ
+  под журналом в конце userdata, `tools/herolte-drop.py`). herosb ещё и
+  подменяет `_UIStatusBarVisualProvider_Fallback` на `_Phone` в SpringBoard
+  (запасной способ против красной полосы).
+- `xnu/patches/0405-a50-drop-zone.patch`: `herolte_drop_apply()` и для A50
+  (Wi-Fi early — нет). `tools/herolte-drop.py`: `--dev`, `conv=notrunc,fsync`.
+- xnu12 на телефоне: **рабочий стол iOS** (фото: виджеты Weather/Calendar,
+  иконки, док; тач работает), но вверху всё ещё красная полоса
+  `rdar:45025538` с вырезом. Причина точнее: iPhone 12 mini рисует в 375×812
+  точек и уменьшает до 1080×2340, а мы рисуем прямо в 360×780 точек —
+  такого экрана нет ни у одного iPhone, subtype 2340 не помогает.
+- Путь S7: `libherosb` в SpringBoard подменяет
+  `_UIStatusBarVisualProvider_Fallback`. `herosb.c`: класс-замена теперь
+  читается из `/private/var/herolte/statusbar.provider` (иначе, как было,
+  `_Phone`); для A50 — `_UIStatusBarVisualProvider_Split58` (часы слева,
+  середина свободна под вырез камеры). `mesa-ios.yml` собирается и на `a50`.
+- `E:\iOS-A50\flash\drop\` (вне git): `wallpaper.png` 1080×2340 (растянута из
+  присланных 376×816), `statusbar.provider`.
+- Камера: не делаем — сенсоры A50 идут через ISP Exynos с закрытой прошивкой,
+  а камера iOS говорит с драйвером ISP Apple по закрытому протоколу; у S7
+  камер тоже нет.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon

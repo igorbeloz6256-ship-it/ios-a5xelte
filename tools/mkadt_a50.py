@@ -49,7 +49,7 @@ def child(node, name, required=True):
     return None
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=2340):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # compatible[0]/model: the iPhone X userland (D22AP), as on herolte.
     # 'samsung,a5xelte' keeps SweetPlatformExpert's IONameMatch.
@@ -67,6 +67,12 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
     product = child(root, 'product', required=False)
     if product is not None:
         set_prop(product, 'artwork-display-gamut', mkadt.cstr('sRGB'))
+        # 1080x2340 at @3x is 360x780 points: the iPhone 12 mini's screen. With
+        # the iPhone X's 2436 UIKit finds no status bar layout for it and draws
+        # the red rdar:45025538 bar (mkadt_herolte.py, herosb.c); 2340 is the
+        # 12 mini's artwork-device-subtype.
+        set_prop(product, 'artwork-device-subtype', mkadt.u32(subtype))
+        set_prop(product, 'artwork-scale-factor', mkadt.u32(3))
 
     # Logical 0..3: Cortex-A53, MPIDR 0x0..0x3 (boot cluster); 4..7:
     # Cortex-A73, MPIDR 0x100..0x103 (exynos9610.dts; A50 kernel patch 0402,
@@ -149,11 +155,13 @@ if __name__ == '__main__':
     parser.add_argument('--canvas', default=f'{FB_WIDTH}x{FB_HEIGHT}', help='presented display WxH')
     parser.add_argument('--bank2', action='store_true',
                         help='XNU RAM = the second bank (below uH EL2_EARLYMEM) instead of 512 MiB at 0x90000000')
+    parser.add_argument('--subtype', type=int, default=2340,
+                        help='/product artwork-device-subtype (2340 = iPhone 12 mini, 2436 = iPhone X)')
     parser.add_argument('--dump', action='store_true')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
     dram = (BANK2_BASE, BANK2_SIZE) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram))
+    blob = adt.serialize(build(canvas, dram, args.subtype))
     args.output.write_bytes(blob)
     if args.dump:
         adt.dump(adt.parse(blob)[0])

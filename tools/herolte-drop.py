@@ -169,12 +169,17 @@ def main():
     ap.add_argument('adb')
     ap.add_argument('items', nargs='*', help='DEST=SRC')
     ap.add_argument('--clear', action='store_true', help='erase the package header')
+    # Galaxy A50: --dev /dev/block/by-name/userdata (GPT p32, lower case).
+    ap.add_argument('--dev', default=DEV, help=f'target partition (default {DEV})')
     args = ap.parse_args()
+    dev = args.dev
 
-    size = int(adb(args.adb, 'shell', f'blockdev --getsize64 {DEV}').strip())
+    size = int(adb(args.adb, 'shell', f'blockdev --getsize64 {dev}').strip())
     first = size // BLOCK - LOG_BLOCKS - DROP_BLOCKS
+    # conv=notrunc: the A50 TWRP's toybox dd ftruncate()s the block device at
+    # seek otherwise and fails (tools/herolte-flash-root.py).
     if args.clear:
-        adb(args.adb, 'shell', f'dd if=/dev/zero of={DEV} bs={BLOCK} seek={first} count=1 conv=fsync')
+        adb(args.adb, 'shell', f'dd if=/dev/zero of={dev} bs={BLOCK} seek={first} count=1 conv=notrunc,fsync')
         print('drop zone cleared')
         return
     if not args.items:
@@ -183,8 +188,8 @@ def main():
     local = 'herolte-drop.bin'
     open(local, 'wb').write(blob)
     adb(args.adb, 'push', local, '/tmp/drop.bin')
-    adb(args.adb, 'shell', f'dd if=/tmp/drop.bin of={DEV} bs={BLOCK} seek={first} conv=fsync')
-    back = adb(args.adb, 'shell', f'dd if={DEV} bs={BLOCK} skip={first} count={len(blob) // BLOCK} '
+    adb(args.adb, 'shell', f'dd if=/tmp/drop.bin of={dev} bs={BLOCK} seek={first} conv=notrunc,fsync')
+    back = adb(args.adb, 'shell', f'dd if={dev} bs={BLOCK} skip={first} count={len(blob) // BLOCK} '
                                   f'2>/dev/null | sha256sum').split()[0].decode()
     adb(args.adb, 'shell', 'rm /tmp/drop.bin')
     os.remove(local)

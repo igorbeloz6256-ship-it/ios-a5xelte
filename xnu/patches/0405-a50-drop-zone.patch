@@ -1,0 +1,22 @@
+diff --git a/bsd/kern/bsd_init.c b/bsd/kern/bsd_init.c
+index 4ebf801..db219a9 100644
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -1108,11 +1108,15 @@ bsdinit_task(void)
+ 
+ 	bsd_init_kprintf("bsd_do_post - done");
+ 
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE) && !defined(ARM64_BOARD_CONFIG_A50)
+-	/* Files from the USERDATA drop zone, before launchd (bsd/dev/herolte_drop.c). */
++#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++	/* Files from the USERDATA drop zone, before launchd (bsd/dev/herolte_drop.c).
++	 * A50 too: it only reads through the UFS driver (0401), and A50's USERDATA
++	 * has the same layout below the persistent log. */
+ 	herolte_drop_apply();
++#if !defined(ARM64_BOARD_CONFIG_A50)
+ 	/* en0 for the Wi-Fi before wifid and configd look for it (bsd/dev/herolte_wifi.c) */
+ 	herolte_wifi_early();
++#endif
+ #endif
+ 	load_init_program(p);
+ 	lock_trace = 1;
