@@ -67,11 +67,15 @@ def main():
     ap.add_argument('--state', default='herolte-flash-root.state')
     ap.add_argument('--diff', action='store_true',
                     help='read each chunk back first and skip it if the phone already has it')
+    # Galaxy A50: --dev /dev/block/by-name/userdata (GPT p32, lower case).
+    ap.add_argument('--dev', default=DEV, help=f'target partition (default {DEV})')
     a = ap.parse_args()
+    dev = a.dev
+    print(f'target {dev}', flush=True)
 
     if adb(['shell', "mount | grep -c ' /data ' || true"], a.adb).strip() != '0':
         raise SystemExit('/data is mounted; unmount it in TWRP first')
-    size = int(adb(['shell', f'blockdev --getsize64 {DEV}'], a.adb).strip())
+    size = int(adb(['shell', f'blockdev --getsize64 {dev}'], a.adb).strip())
     done = set()
     if os.path.exists(a.state):
         done = {int(x) for x in open(a.state).read().split()}
@@ -88,8 +92,10 @@ def main():
         if all(i in done for i in range(first, end)):
             return
         n = (end - first) * CHUNK // MIB
-        adb(['shell', f'dd if=/dev/zero of={DEV} bs=1048576 seek={first * CHUNK // MIB} '
-             f'count={n} conv=fsync 2>/dev/null'], a.adb)
+        # conv=notrunc: the A50 TWRP's toybox dd otherwise ftruncate()s the
+        # block device at seek and fails with EINVAL.
+        adb(['shell', f'dd if=/dev/zero of={dev} bs=1048576 seek={first * CHUNK // MIB} '
+             f'count={n} conv=notrunc,fsync 2>/dev/null'], a.adb)
         for i in range(first, end):
             state.write(f'{i}\n')
         state.flush()
@@ -115,7 +121,7 @@ def main():
                 zero_run = None
             if index not in done and a.diff:
                 seek, count = offset // MIB, (len(data) + MIB - 1) // MIB
-                back = adb(['shell', f'dd if={DEV} bs=1048576 skip={seek} count={count} '
+                back = adb(['shell', f'dd if={dev} bs=1048576 skip={seek} count={count} '
                             f'2>/dev/null | head -c {len(data)} | sha256sum'], a.adb).split()[0]
                 if back == hashlib.sha256(data).hexdigest():
                     state.write(f'{index}\n')
@@ -127,9 +133,9 @@ def main():
                     f.write(data)
                 adb(['push', local, '/tmp/chunk.gz'], a.adb)
                 seek, count = offset // MIB, (len(data) + MIB - 1) // MIB
-                out = adb(['shell', f'gzip -dc /tmp/chunk.gz | dd of={DEV} bs=1048576 '
-                           f'seek={seek} conv=fsync 2>&1; rm -f /tmp/chunk.gz'], a.adb)
-                back = adb(['shell', f'dd if={DEV} bs=1048576 skip={seek} count={count} '
+                out = adb(['shell', f'gzip -dc /tmp/chunk.gz | dd of={dev} bs=1048576 '
+                           f'seek={seek} conv=notrunc,fsync 2>&1; rm -f /tmp/chunk.gz'], a.adb)
+                back = adb(['shell', f'dd if={dev} bs=1048576 skip={seek} count={count} '
                             f'2>/dev/null | head -c {len(data)} | sha256sum'], a.adb).split()[0]
                 want = hashlib.sha256(data).hexdigest()
                 if back != want:

@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Pull and decode the herolte persistent console log (patch 0206) via TWRP.
 
-  herolte-log-pull.py ADB OUT.txt
+  herolte-log-pull.py ADB OUT.txt [DEV]
+
+DEV defaults to the S7's USERDATA; on the Galaxy A50 it is
+/dev/block/by-name/userdata.
 
 The log is the last 4 MiB + 4 KiB of USERDATA: block 0 is the header
 ("HEROLOG1", version, ring size, total bytes, flush sequence), then the ring.
@@ -26,12 +29,13 @@ def adb(tool, *args):
 
 
 def main():
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         raise SystemExit(__doc__)
     tool, out = sys.argv[1], Path(sys.argv[2])
-    size = int(adb(tool, 'shell', f'blockdev --getsize64 {DEV}').strip())
+    dev = sys.argv[3] if len(sys.argv) == 4 else DEV
+    size = int(adb(tool, 'shell', f'blockdev --getsize64 {dev}').strip())
     first = size // BLOCK - (1 + RING // BLOCK)
-    adb(tool, 'shell', f'dd if={DEV} of=/tmp/herolog.bin bs={BLOCK} skip={first} '
+    adb(tool, 'shell', f'dd if={dev} of=/tmp/herolog.bin bs={BLOCK} skip={first} '
         f'count={1 + RING // BLOCK} 2>/dev/null')
     raw = out.with_suffix('.bin')
     adb(tool, 'pull', '/tmp/herolog.bin', str(raw))

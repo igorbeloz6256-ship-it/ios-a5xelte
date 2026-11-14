@@ -26,7 +26,9 @@ permissions:
 jobs:
   root:
     if: github.event.repository.private == true
-    runs-on: macos-14
+    # macos-14 is gone (2026-11: "The configuration 'macos-14-arm64-us-xl' is
+    # not supported"); the xnu workflow builds on macos-15-intel.
+    runs-on: macos-15-intel
     timeout-minutes: 180
     env:
       GH_TOKEN: ${{ github.token }}

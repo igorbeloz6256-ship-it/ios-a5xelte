@@ -68,15 +68,42 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE)):
     if product is not None:
         set_prop(product, 'artwork-display-gamut', mkadt.cstr('sRGB'))
 
-    # One CPU: the boot Cortex-A53 (SWEET_SMP_MAX_CPUS 1 in the A50 kernel;
-    # SweetCPU panics on any other MPIDR or count).
-    cpu0 = child(child(root, 'cpus'), 'cpu0')
+    # Logical 0..3: Cortex-A53, MPIDR 0x0..0x3 (boot cluster); 4..7:
+    # Cortex-A73, MPIDR 0x100..0x103 (exynos9610.dts; A50 kernel patch 0402,
+    # SweetCPU checks this order). One XNU cluster; cpus=N boots the first N
+    # (cpus=1 = the boot CPU only, as before). A73 nodes also carry
+    # 'arm,cortex-a53': SweetCPU's IONameMatch (KernelConfigTables.cpp).
+    cpus = child(root, 'cpus')
+    cpu0 = child(cpus, 'cpu0')
     set_prop(cpu0, 'compatible', mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8'))
     set_prop(cpu0, 'reg', mkadt.u32(BOOT_MPIDR))
     set_prop(cpu0, 'timebase-frequency', mkadt.u32(TIMEBASE))
     set_prop(cpu0, 'peripheral-frequency', mkadt.u32(TIMEBASE))
     set_prop(cpu0, 'fixed-frequency', mkadt.u32(TIMEBASE))
-    set_prop(cpu0, 'clock-frequency', mkadt.u32(1742000000))
+    set_prop(cpu0, 'clock-frequency', mkadt.u32(1600000000))
+    for logical in range(1, 8):
+        big = logical >= 4
+        core = logical - 4 if big else logical
+        cpus.children.append(mkadt.node(f'cpu{logical}', [
+            ('device_type', mkadt.cstr('cpu')),
+            ('compatible', (mkadt.cstr('arm,cortex-a73') if big else b'') +
+                           mkadt.cstr('arm,cortex-a53') + mkadt.cstr('ARM,v8')),
+            ('reg', mkadt.u32(0x100 | core if big else core)),
+            ('cpu-id', mkadt.u32(logical)),
+            ('cluster-id', mkadt.u32(0)),
+            ('cluster-type', mkadt.u32(0)),
+            ('die-cluster-id', mkadt.u32(0)),
+            ('cluster-core-id', mkadt.u32(logical)),
+            ('l2-cache-id', mkadt.u32(1 if big else 0)),
+            ('l3-cache-id', mkadt.u32(0)),
+            ('state', mkadt.cstr('stopped')),
+            ('timebase-frequency', mkadt.u32(TIMEBASE)),
+            ('clock-frequency', mkadt.u32(2300000000 if big else 1600000000)),
+            ('bus-frequency', mkadt.u32(100000000)),
+            ('memory-frequency', mkadt.u32(1794000000)),
+            ('peripheral-frequency', mkadt.u32(TIMEBASE)),
+            ('fixed-frequency', mkadt.u32(TIMEBASE)),
+        ]))
 
     arm_io = child(root, 'arm-io')
     set_prop(arm_io, 'device_type', mkadt.cstr('a50-io'))

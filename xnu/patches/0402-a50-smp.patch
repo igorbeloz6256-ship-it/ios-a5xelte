@@ -1,0 +1,49 @@
+diff --git a/iokit/Kernel/arm/SweetCPU.cpp b/iokit/Kernel/arm/SweetCPU.cpp
+index b269868..7d189c5 100644
+--- a/iokit/Kernel/arm/SweetCPU.cpp
++++ b/iokit/Kernel/arm/SweetCPU.cpp
+@@ -95,7 +95,7 @@ SweetCPU::start(IOService *provider)
+ 	/* Logical 0..3 = A53 MPIDR 0x100..0x103 (boot cluster), 4..7 = Mongoose
+ 	 * MPIDR 0x0..0x3, the order of the ADT /cpus nodes (mkadt_herolte.py). */
+ 	uint32_t expected_mpidr = cpu->cpu_id < 4 ? A5XELTE_BOOT_MPIDR + cpu->cpu_id :
+-	    cpu->cpu_id - 4;
++	    A5XELTE_FAST_MPIDR + cpu->cpu_id - 4;
+ 	if (cpu->phys_id != expected_mpidr || topology->num_cpus > SWEET_SMP_MAX_CPUS) {
+ 		panic(CPU_PORT_NAME " CPU: unsupported topology cpu=%u mpidr=0x%x count=%u",
+ 		    cpu->cpu_id, cpu->phys_id, topology->num_cpus);
+@@ -119,7 +119,7 @@ SweetCPU::start(IOService *provider)
+ 	}
+ #if defined(A5XELTE)
+ #if defined(HEROLTE)
+-	cpuName = OSSymbol::withCStringNoCopy(cpu->cpu_id < 4 ? "Cortex-A53" : "Mongoose");
++	cpuName = OSSymbol::withCStringNoCopy(cpu->cpu_id < 4 ? "Cortex-A53" : A5XELTE_FAST_CORE_NAME);
+ #else
+ 	cpuName = OSSymbol::withCStringNoCopy("Cortex-A53");
+ #endif
+diff --git a/pexpert/pexpert/arm64/A5XELTE.h b/pexpert/pexpert/arm64/A5XELTE.h
+index e723d73..559ff8f 100644
+--- a/pexpert/pexpert/arm64/A5XELTE.h
++++ b/pexpert/pexpert/arm64/A5XELTE.h
+@@ -20,7 +20,12 @@
+  * and starts XNU's loader on a Cortex-A53 with MPIDR 0x0.
+  */
+ #define HEROLTE                       1
+-#define SWEET_SMP_MAX_CPUS            1     /* boot CPU only until A50 SMP */
++/* Logical 0..3: Cortex-A53 MPIDR 0x0..0x3 (boot cluster); 4..7: Cortex-A73
++ * MPIDR 0x100..0x103 (exynos9610.dts cpu@100..103 / cpu@0..3, PSCI 0.2 by
++ * SMC, cpu_on 0xC4000003 as on HEROLTE). cpus=N picks the first N. */
++#define SWEET_SMP_MAX_CPUS            8
++#define A5XELTE_FAST_MPIDR            0x100
++#define A5XELTE_FAST_CORE_NAME        "Cortex-A73"
+ #define A5XELTE_FB_PA                 0xca000000
+ #define A5XELTE_FB_WIDTH              1080
+ #define A5XELTE_FB_HEIGHT             2340
+@@ -46,6 +51,8 @@
+ #define A5XELTE_MARKER_PA             0x8ffff100
+ /* S-Boot starts on the Cortex-A53 "Apollo" cluster, Aff1 = 1. */
+ #define A5XELTE_BOOT_MPIDR            0x100
++#define A5XELTE_FAST_MPIDR            0x0
++#define A5XELTE_FAST_CORE_NAME        "Mongoose"
+ #else
+ #define SWEET_SMP_MAX_CPUS            1
+ #define A5XELTE_FB_PA                 0x67000000
