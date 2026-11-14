@@ -424,6 +424,57 @@
 - `mkadt_a50.py`: 8 узлов CPU (A73 — с `arm,cortex-a73` и
   `arm,cortex-a53`). Только с ядром 0402; `cpus=1` ограничивает топологию.
 
+### 🍎 Экран блокировки iOS на A50 (15:05, xnu6, `sweetfb_native=1`, 1 CPU)
+
+- xnu6 записан (чтение обратно совпало), reboot 15:05:45. Пользователь:
+  **сначала логотип Apple, потом экран блокировки iOS** (фото): «Wednesday,
+  December 31», «4:03», кнопка камеры, полоска «домой», строка состояния;
+  фон оранжево-красный (возможно, перепутаны каналы R/B — проверить).
+  Даты нет (RTC не подключён).
+- Журнал `logs\boot-xnu6.txt` (flush #40, ~6 мин): `SWEET FB: AppleCLCD
+  1080x2340 … presented as 1080x2340`, `display on`, 18 свопов поверхностей
+  2/3 1080×2340 `BGRA`, копия кадра на панель ~5,2 мс, 0,1–0,5 кадра/с;
+  `MB free 24–31 active ~915 inactive ~600` на 360 с.
+- Коммит `c2ce8e9` (0402 SMP, инструменты A50) отправлен, сборка xnu
+  43594040830 — success (12:17–12:34 UTC).
+- `xnu7`: ядро 17386496 байт (SHA256SUMS OK, строка `Cortex-A73` внутри),
+  ADT `--bank2` с 8 CPU (12412 байт), cmdline как xnu6, но `cpus=4` (4 A53,
+  как первый SMP-шаг S7). `boot.img` sha256 `8f14a903…67e1`, хост-прогон
+  проходит (boot_args `0x88252c000`).
+- xnu7 записан, reboot 16:41:50. Пользователь: **экран блокировки за ~1,5
+  мин**. Журнал `logs\boot-xnu7.txt`: `requested=4 selected=4 (limit=8)`;
+  для cpu1..3 `entry 0x88143f000 via trampoline 0x8fffe000`, `PSCI CPU_ON
+  rc=0`, `mpidr=0x1..0x3 came alive; SGI1 OK`, `midr=0x410fd034`,
+  `vct_lag≈17500`; **`4/4 CPUs initialized, SGI1 verified`** — PSCI под
+  uH и трамплин ниже 4 ГиБ работают. Кадры до 1,5/с (копия 2–3,5 мс,
+  параллельно), `MB free 35–60`. Паник нет.
+- `xnu8`: то же, `cpus=8` (A73 MPIDR 0x100..0x103). Записан, reboot
+  17:09:05. Пользователь: **экран блокировки чуть больше чем за минуту**.
+  Журнал `logs\boot-xnu8.txt`: `requested=8 selected=8 (limit=8)`, cpu4..7
+  `PSCI CPU_ON rc=0`, `mpidr=0x100..0x103 came alive; SGI1 OK`,
+  **`midr=0x410fd092` (Cortex-A73 r0p2)**, `vct_lag≈16000–16600`;
+  **`8/8 CPUs initialized, SGI1 verified`**; timer test на каждом из 8 ядер
+  ~20 мс. Кадры до 4,1/с (21 своп за 5 с), копия 4–12 мс. Паник нет.
+
+### Ввод: кнопки (патч 0403) и разведка тача
+
+- DTS A50 `gpio_keys`: все три кнопки на **GPA1** (pinctrl_0 ALIVE
+  `0x11850000`, банк `+0x20`): Power — pin 7, Vol+ — 5, Vol− — 6, функция
+  0xf (EINT), активный низкий; кнопки «Домой» нет.
+- `xnu/patches/0403-a50-keys.patch`: `a5xelte_keys.c` с таблицей A50
+  (только чтение `GPA1_DAT` = `0x11850024` раз в 10 мс, антидребезг, 3
+  кнопки → `sweet_hid_key` 0/1/2), в журнал — `GPA1 con/dat/pud` (для
+  проверки: у pin 5–7 функция 0xf, `con & 0xfff00000 == 0xfff00000`);
+  `IOKitBSDInit` для A50 вызывает `a5xelte_keys_init()` (`a5keys=0`
+  выключает). На LF-дереве ложится поверх 0402.
+- Тач (DTS): Melfas **MSS100** (`melfas,mms_ts`, I2C-адрес 0x48, прошивка
+  `mss100_a50.fw`, события формата 8 по 12 байт, 4095×4095) на
+  **`i2c_4` = `i2c@13870000`** (обычный I2C Samsung, не HSI2C — как
+  `0x13850000` у A5/7580 в `a5xelte_touch.c`); питание — `tsp_ldo_en`,
+  regulator-fixed 3,0 В по **GPIO gpg3-1** (active high); IRQ — gpa0-0;
+  SCL/SDA — gpp1-1/gpp1-0. Нужно: адреса банков gpg3/gpp1/gpa0, тактирование
+  I2C-4, протокол MSS100 (вероятно MIP4).
+
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon
   `0xca000000`+`0x9a3f80`, RAM `0x90000000`+512 МиБ, один CPU с MPIDR 0.
