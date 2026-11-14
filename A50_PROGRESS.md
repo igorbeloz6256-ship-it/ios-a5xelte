@@ -597,6 +597,39 @@
   с ним SweetHID нормализует тач по всей панели. На CPU рисуется на 41%
   меньше пикселей. Хуки шторки herosb выключаются файлом `gestures.off`
   (жесты и так родные, home-button-type 2 из D22AP), обои остаются.
+- Коммит `c8b6e8e`: xnu 43635906385 и mesa-ios 43635906389 — success,
+  SHA256SUMS OK. В ядре есть `HEROLTE USER %d %s: %s`; в `libdrm.2.dylib`
+  есть `mov w0,#0x48455230` / `mov w16,#533` / `svc #0x80`. Рецепт сборки
+  BOOT проверен: xnu13, пересобранный из своих входов, совпал байт в байт.
+  `xnu14\boot.img` (ADT `--bank2 --xr`, cmdline xnu13 + `sweetfb_scale=1
+  sweetfb_lw=828 sweetfb_lh=1792`, 494 символа), sha256 `b8cbd5f6…8f92`,
+  хост-прогон загрузчика проходит (сегменты в 0x881004000…, в нижнем окне
+  ничего).
+- Пакет 1794688563 (`lib/libherosb.dylib`, `lib/libdrm.2.dylib`,
+  `wallpaper.png` 828×1792, `gestures.off`), 892928 байт, блок 13711359,
+  **verified**. xnu14 записан в BOOT (чтение обратно совпало), reboot 23:36:21.
+- **xnu14 на телефоне: шторка нормальная** (пользователь: «Шторка работает»),
+  экран XR масштабируется на всю панель, тач попадает. **Обоев нет.** В логе
+  (`boot-xnu14.txt`) по-прежнему `libherosb inserted` и политика 0x23, но
+  ни одной строки `HEROLTE USER`: конструктор herosb не выполнялся.
+- Причина найдена чтением HFSX из TWRP (`herolte-hfs-read.py`, теперь с
+  `HEROLTE_DEV=/dev/block/by-name/userdata`; `stat` показывает режим и uid
+  папок): `/private/var/herolte` — **0744 root:wheel**. Её создал launchd при
+  первом запуске iOS для `autorun.out` (StandardOutPath задания autorun;
+  cnid 326205/326206, раньше любого пакета). `hdrop_mkdir` существующую
+  папку не трогал. SpringBoard работает как mobile и не может войти в папку →
+  dyld не открывает `lib/libherosb.dylib` и с флагом
+  ALLOW_FAILED_LIBRARY_INSERTION молча её пропускает. Файлы на месте и
+  совпадают с пакетом (sha256), `lib/` 0755. Шелла на корне нет
+  (`/bin`: только `df`, `ps`), поэтому chmod из autorun невозможен.
+- **0407:** `hdrop_mkdir` возвращает существующей папке drop zone её режим
+  (0755) и пишет `HEROLTE DROP: … mode 744 -> 755 (0)`. Это делается при каждой
+  загрузке с пакетом, до проверки id пакета, а значит до SpringBoard.
+- **Батарея:** на A50 SweetBattery выключен (0400: он для MAX77854 у S7),
+  поэтому iOS показывает не настоящий заряд. В TWRP:
+  `sm5713-fuelgauge`/`sm5713-charger`, MFD `sm5713mfd` на i2c-1 по адресу 0x49,
+  dummy 0x25 и 0x71; `battery`: 100%, 4312000 мкВ, Full (на USB). i2c-1 —
+  `s3c2410-i2c`, как у тача.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon

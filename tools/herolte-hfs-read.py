@@ -5,7 +5,7 @@
   herolte-hfs-read.py get  PATH OUT        copy a file (data fork; decmpfs not handled)
   herolte-hfs-read.py stat PATH
 
-Environment: HEROLTE_ADB (adb path), ANDROID_SERIAL. Output may be Apple's files: keep it off Git.
+Environment: HEROLTE_ADB (adb path), ANDROID_SERIAL, HEROLTE_DEV (partition). Output may be Apple's files: keep it off Git.
 
 Only `dd if=DEV` reads, through `adb exec-out`. Never writes to the device.
 """
@@ -13,7 +13,8 @@ import struct, subprocess, sys, os
 
 ADB = os.environ.get('HEROLTE_ADB', 'adb')
 SERIAL = os.environ.get('ANDROID_SERIAL', '')
-DEV = '/dev/block/sda18'
+# HEROLTE_DEV: another partition (Galaxy A50: /dev/block/by-name/userdata).
+DEV = os.environ.get('HEROLTE_DEV', '/dev/block/sda18')
 
 
 class Dev:
@@ -294,8 +295,10 @@ def main():
             print('file', c, oct(m), fk[0], 'bytes', len(fk[1]), 'extents')
             print('owner flags', hex(rec[41]), 'special', be('I', rec, 44)[0], 'type/creator', rec[64:72],
                   'rsrc size', be('Q', rec, 168)[0])
+            print('uid %d gid %d' % be('II', rec, 32))
         else:
-            print('folder', cnid)
+            print('folder', cnid, oct(be('H', rec, 42)[0]) if rec is not None else '', 'uid %d gid %d' % be('II', rec, 32)
+                  if rec is not None else '')
     elif cmd == 'get':
         c, m, (size, exts) = file_info(rec)
         exts = fs.all_extents(exts, c, 0)

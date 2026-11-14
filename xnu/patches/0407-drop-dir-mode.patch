@@ -1,0 +1,26 @@
+diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
+index d3e8ed8..95972c2 100644
+--- a/bsd/dev/herolte_drop.c
++++ b/bsd/dev/herolte_drop.c
+@@ -120,6 +120,21 @@ hdrop_mkdir(const char *path, int mode, vfs_context_t ctx)
+ 		VATTR_SET(&va, va_type, VDIR);
+ 		VATTR_SET(&va, va_mode, mode & ALLPERMS);
+ 		error = vn_mkdir(dvp, &vp, &nd, &va, ctx);
++	} else if (vnode_isdir(vp)) {
++		/*
++		 * On the Galaxy A50's root launchd made /private/var/herolte first, for autorun.out (the autorun job's
++		 * StandardOutPath), as 0744: mobile could not reach lib/, and dyld left SpringBoard's libherosb out without a
++		 * word. A directory of the drop zone gets its mode back.
++		 */
++		struct vnode_attr va;
++		VATTR_INIT(&va);
++		VATTR_WANTED(&va, va_mode);
++		if (vnode_getattr(vp, &va, ctx) == 0 && (va.va_mode & ALLPERMS) != (mode & ALLPERMS)) {
++			int was = va.va_mode & ALLPERMS;
++			VATTR_INIT(&va);
++			VATTR_SET(&va, va_mode, mode & ALLPERMS);
++			printf("HEROLTE DROP: %s mode %o -> %o (%d)\n", path, was, mode & ALLPERMS, vnode_setattr(vp, &va, ctx));
++		}
+ 	}
+ 	nameidone(&nd);
+ 	if (vp != NULLVP) {
