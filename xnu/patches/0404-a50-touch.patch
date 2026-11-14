@@ -1,0 +1,434 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index c8762c8..fddc804 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@ bsd/dev/sweet_apple80211.c		standard
+ bsd/dev/herolte_gl.c			standard
+ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
++bsd/dev/a50_touch.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a50_touch.c b/bsd/dev/a50_touch.c
+new file mode 100644
+index 0000000..97c7d6b
+--- /dev/null
++++ b/bsd/dev/a50_touch.c
+@@ -0,0 +1,365 @@
++/*
++ * Galaxy A50 (SM-A505FN, Exynos 9610) touchscreen: Melfas MSS100 (MIP4) at
++ * I2C address 0x48 on i2c_4 (S3C2440-style I2C at 0x13870000).
++ *
++ * From the A50 kernel (FreshROMs android_kernel_samsung_exynos9610_mint):
++ *  - exynos9610-a50_common.dtsi: mms_ts@48 on i2c_4, "melfas,vdd_en" =
++ *    tsp_ldo_en = regulator-fixed 3.0 V on GPIO gpg3-1 (active high),
++ *    IRQ gpa0-0, SCL/SDA gpp1-1/gpp1-0 (i2c4_bus: function 2, no pull),
++ *    event_info <8 12> (EVENT_FORMAT_WITH_PRESSURE_2BYTE, 12-byte events);
++ *  - pinctrl-exynos-arm64.c exynos9610_pin_banks4 (TOP, 0x139B0000): gpp1
++ *    at 0x020, gpg3 at 0x120; CON 4 bits, DAT 1 bit, PUD 4 bits per pin;
++ *  - melfas_mss100{,_reg}.h: MIP_R0_EVENT 0x02, PACKET_INFO 0x10 (size in
++ *    bits 6:0, alert in bit 7), PACKET_DATA 0x11; per event: id =
++ *    (p0 & 0x0f) - 1, type = p0 >> 4 (1 = screen), state = p1 & 1 (0 =
++ *    release), x = (p2 & 0x0f) << 8 | p3, y = (p2 >> 4) << 8 | p4;
++ *    power-on delay 90 ms (mms_power_control).
++ * TWRP on this phone shows the same: gpg3-1 CON 0x1 DAT 1, gpp1-0/1 CON 0x2.
++ *
++ * Writes: only the gpg3-1 and gpp1-0/1 fields (read-modify-write) and the
++ * I2C-4 controller. Events are polled (no interrupt). Boot-arg a50touch=0
++ * turns the driver off.
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_hid_touch(int finger, int down, int x, int y);
++void a50_touch_probe(void);
++
++#define A50_TOP_PINCTRL_PA      0x139b0000u
++#define A50_GPP1                0x020u          /* SDA pin 0, SCL pin 1 */
++#define A50_GPG3                0x120u          /* tsp_ldo_en pin 1 */
++#define A50_ALIVE_PINCTRL_PA    0x11850000u
++#define A50_GPA0                0x020u          /* touch IRQ pin 0, active low */
++#define PIN_CON                 0x00u
++#define PIN_DAT                 0x04u
++#define PIN_PUD                 0x08u
++
++#define A50_I2C4_PA             0x13870000u
++#define IICCON                  0x00u
++#define IICSTAT                 0x04u
++#define IICDS                   0x0cu
++#define IICLC                   0x10u
++
++#define MMS_ADDR                0x48u
++#define MMS_EVENT_SIZE          12u
++#define MMS_MAX_PACKET          200u
++#define A50_PANEL_W             1080
++#define A50_PANEL_H             2340
++#define A50_TOUCH_FINGERS       10
++
++static vm_offset_t at_top, at_alive, at_i2c;
++static int at_res_x = 4096, at_res_y = 4096;
++static bool at_down[A50_TOUCH_FINGERS];
++static int at_x[A50_TOUCH_FINGERS], at_y[A50_TOUCH_FINGERS];
++static int at_sleep_chan;
++
++static uint32_t
++at_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++at_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++/* Set the 4-bit field of one pin in a CON/PUD register, keeping the others. */
++static void
++at_set_field(vm_offset_t base, uint32_t reg, unsigned pin, uint32_t value)
++{
++	uint32_t v = at_rd(base, reg);
++	v = (v & ~(0xfu << (4 * pin))) | ((value & 0xfu) << (4 * pin));
++	at_wr(base, reg, v);
++}
++
++static void
++at_sleep_ms(unsigned ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&at_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* S3C2440 I2C, as bsd/dev/a5xelte_touch.c: one message, then STOP. */
++static bool
++at_wait_irq(void)
++{
++	for (unsigned n = 0; n < 20000; n++) {
++		if (at_rd(at_i2c, IICCON) & 0x10u) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++static void
++at_clear_irq(void)
++{
++	at_wr(at_i2c, IICCON, at_rd(at_i2c, IICCON) & ~0x10u);
++}
++
++static void
++at_stop(void)
++{
++	at_wr(at_i2c, IICSTAT, at_rd(at_i2c, IICSTAT) & ~0x20u);
++	at_clear_irq();
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(at_rd(at_i2c, IICSTAT) & 0x20u)) {
++			break;
++		}
++		delay(1);
++	}
++}
++
++static unsigned at_errors;
++
++static bool
++at_message(bool receive, uint8_t *bytes, unsigned count)
++{
++	const uint32_t mode = receive ? 0x90u : 0xd0u;
++	bool ok = false;
++	if (!count || count > 255) {
++		return false;
++	}
++	for (unsigned n = 0; n < 5000; n++) {
++		if (!(at_rd(at_i2c, IICSTAT) & 0x20u)) {
++			break;
++		}
++		if (n == 4999) {
++			if (at_errors++ < 8) {
++				printf("A50 TOUCH: I2C4 busy stat=%#x\n", at_rd(at_i2c, IICSTAT));
++			}
++			return false;
++		}
++		delay(1);
++	}
++	at_wr(at_i2c, IICCON, 0xe3u);           /* ACK, IRQ enable, PCLK/512/4 */
++	at_wr(at_i2c, IICLC, 7u);               /* SDA delay and filter */
++	at_wr(at_i2c, IICSTAT, mode);
++	at_wr(at_i2c, IICDS, (MMS_ADDR << 1) | (receive ? 1u : 0u));
++	delay(1);
++	at_wr(at_i2c, IICSTAT, mode | 0x20u);   /* START */
++	if (!at_wait_irq()) {
++		if (at_errors++ < 8) {
++			printf("A50 TOUCH: I2C4 address timeout stat=%#x con=%#x\n",
++			    at_rd(at_i2c, IICSTAT), at_rd(at_i2c, IICCON));
++		}
++		goto out;
++	}
++	if (at_rd(at_i2c, IICSTAT) & 1u) {
++		if (at_errors++ < 8) {
++			printf("A50 TOUCH: I2C4 address NACK stat=%#x\n", at_rd(at_i2c, IICSTAT));
++		}
++		goto out;
++	}
++	for (unsigned n = 0; n < count; n++) {
++		if (receive) {
++			if (n + 1 == count) {
++				at_wr(at_i2c, IICCON, at_rd(at_i2c, IICCON) & ~0x80u);  /* NACK last */
++			}
++		} else {
++			at_wr(at_i2c, IICDS, bytes[n]);
++			delay(1);
++		}
++		at_clear_irq();
++		if (!at_wait_irq()) {
++			if (at_errors++ < 8) {
++				printf("A50 TOUCH: I2C4 data timeout byte=%u stat=%#x\n", n,
++				    at_rd(at_i2c, IICSTAT));
++			}
++			goto out;
++		}
++		if (receive) {
++			bytes[n] = (uint8_t)at_rd(at_i2c, IICDS);
++		} else if (at_rd(at_i2c, IICSTAT) & 1u) {
++			if (at_errors++ < 8) {
++				printf("A50 TOUCH: I2C4 data NACK byte=%u\n", n);
++			}
++			goto out;
++		}
++	}
++	ok = true;
++out:
++	at_stop();
++	return ok;
++}
++
++/* MIP4 register read: write the 2-byte address, STOP, then read. */
++static bool
++at_mip_read(uint8_t r0, uint8_t r1, uint8_t *buf, unsigned len)
++{
++	uint8_t addr[2] = { r0, r1 };
++	return at_message(false, addr, 2) && at_message(true, buf, len);
++}
++
++static void
++at_release_all(void)
++{
++	for (int f = 0; f < A50_TOUCH_FINGERS; f++) {
++		if (at_down[f]) {
++			at_down[f] = false;
++			sweet_hid_touch(f, 0, at_x[f], at_y[f]);
++		}
++	}
++}
++
++static void
++at_report(const uint8_t *p, unsigned *lines)
++{
++	unsigned type = p[0] >> 4;
++	int id = (int)(p[0] & 0x0f) - 1;
++	bool down = p[1] & 1;
++	int x = ((p[2] & 0x0f) << 8) | p[3];
++	int y = ((p[2] >> 4) << 8) | p[4];
++	if (type != 1 || id < 0 || id >= A50_TOUCH_FINGERS) {
++		if ((*lines)++ < 16) {
++			printf("A50 TOUCH: event type %u id %d skipped\n", type, id);
++		}
++		return;
++	}
++	/* Chip coordinates -> panel pixels. */
++	int px = (int)((int64_t)x * A50_PANEL_W / at_res_x);
++	int py = (int)((int64_t)y * A50_PANEL_H / at_res_y);
++	if (down != at_down[id] && (*lines)++ < 64) {
++		printf("A50 TOUCH: finger %d %s at %d,%d (raw %d,%d)\n", id,
++		    down ? "down" : "up", px, py, x, y);
++	}
++	at_down[id] = down;
++	at_x[id] = px;
++	at_y[id] = py;
++	sweet_hid_touch(id, down, px, py);
++}
++
++static void
++at_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	uint8_t buf[MMS_MAX_PACKET + 4];
++	unsigned lines = 0, polls = 0, failures = 0;
++	for (;;) {
++		at_sleep_ms(10);
++		polls++;
++		uint8_t info = 0;
++		if (!at_mip_read(0x02, 0x10, &info, 1)) {
++			if (++failures == 50) {
++				printf("A50 TOUCH: 50 failed polls in a row, releasing contacts\n");
++				at_release_all();
++			}
++			continue;
++		}
++		failures = 0;
++		unsigned size = info & 0x7fu;
++		if (size == 0) {
++			continue;
++		}
++		if (size > MMS_MAX_PACKET || !at_mip_read(0x02, 0x11, buf, size)) {
++			continue;
++		}
++		if (info & 0x80u) {
++			if (lines++ < 64) {
++				printf("A50 TOUCH: alert %#x size %u\n", buf[0], size);
++			}
++			continue;
++		}
++		for (unsigned i = 0; i + MMS_EVENT_SIZE <= size; i += MMS_EVENT_SIZE) {
++			at_report(&buf[i], &lines);
++		}
++	}
++}
++
++void
++a50_touch_probe(void)
++{
++	static bool started;
++	int enabled = 1;
++	thread_t thread;
++
++	if (started) {
++		return;
++	}
++	started = true;
++	PE_parse_boot_argn("a50touch", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("A50 TOUCH: disabled\n");
++		return;
++	}
++	at_top = ml_io_map(A50_TOP_PINCTRL_PA, 0x1000);
++	at_alive = ml_io_map(A50_ALIVE_PINCTRL_PA, 0x1000);
++	at_i2c = ml_io_map(A50_I2C4_PA, 0x1000);
++	if (!at_top || !at_alive || !at_i2c) {
++		printf("A50 TOUCH: mapping failed\n");
++		return;
++	}
++	printf("A50 TOUCH: before: gpg3 con=%#x dat=%#x pud=%#x gpp1 con=%#x dat=%#x pud=%#x"
++	    " gpa0 con=%#x dat=%#x i2c con=%#x stat=%#x lc=%#x\n",
++	    at_rd(at_top, A50_GPG3 + PIN_CON), at_rd(at_top, A50_GPG3 + PIN_DAT),
++	    at_rd(at_top, A50_GPG3 + PIN_PUD), at_rd(at_top, A50_GPP1 + PIN_CON),
++	    at_rd(at_top, A50_GPP1 + PIN_DAT), at_rd(at_top, A50_GPP1 + PIN_PUD),
++	    at_rd(at_alive, A50_GPA0 + PIN_CON), at_rd(at_alive, A50_GPA0 + PIN_DAT),
++	    at_rd(at_i2c, IICCON), at_rd(at_i2c, IICSTAT), at_rd(at_i2c, IICLC));
++
++	/* i2c4_bus: gpp1-0 (SDA), gpp1-1 (SCL) function 2, no pull. */
++	at_set_field(at_top, A50_GPP1 + PIN_PUD, 0, 0);
++	at_set_field(at_top, A50_GPP1 + PIN_PUD, 1, 0);
++	at_set_field(at_top, A50_GPP1 + PIN_CON, 0, 2);
++	at_set_field(at_top, A50_GPP1 + PIN_CON, 1, 2);
++	/* tsp_ldo_en: gpg3-1 output, high (3.0 V to the touch controller). */
++	bool was_on = ((at_rd(at_top, A50_GPG3 + PIN_CON) >> 4) & 0xf) == 1 &&
++	    (at_rd(at_top, A50_GPG3 + PIN_DAT) & 2u);
++	at_wr(at_top, A50_GPG3 + PIN_DAT, at_rd(at_top, A50_GPG3 + PIN_DAT) | 2u);
++	at_set_field(at_top, A50_GPG3 + PIN_CON, 1, 1);
++	printf("A50 TOUCH: power %s; after: gpg3 con=%#x dat=%#x gpp1 con=%#x\n",
++	    was_on ? "was already on" : "switched on", at_rd(at_top, A50_GPG3 + PIN_CON),
++	    at_rd(at_top, A50_GPG3 + PIN_DAT), at_rd(at_top, A50_GPP1 + PIN_CON));
++	if (!was_on) {
++		delay(90 * 1000);       /* mms_power_control: msleep(90) */
++	}
++
++	uint8_t name[16] = { 0 }, res[4] = { 0 }, ver[8] = { 0 }, ready = 0;
++	bool ok = at_mip_read(0x06, 0x00, &ready, 1);
++	printf("A50 TOUCH: ready status %s %#x\n", ok ? "read" : "FAILED", ready);
++	if (ok && at_mip_read(0x01, 0x00, name, sizeof(name))) {
++		name[sizeof(name) - 1] = 0;
++		for (unsigned i = 0; i + 1 < sizeof(name); i++) {
++			if (name[i] && (name[i] < 0x20 || name[i] > 0x7e)) {
++				name[i] = '?';
++			}
++		}
++		printf("A50 TOUCH: product \"%s\"\n", (const char *)name);
++	}
++	if (ok && at_mip_read(0x01, 0x10, res, sizeof(res))) {
++		int rx = res[0] | res[1] << 8, ry = res[2] | res[3] << 8;
++		printf("A50 TOUCH: resolution %d x %d\n", rx, ry);
++		if (rx >= 320 && ry >= 320) {
++			at_res_x = rx;
++			at_res_y = ry;
++		}
++	}
++	if (ok && at_mip_read(0x01, 0x20, ver, sizeof(ver))) {
++		printf("A50 TOUCH: versions boot %02x%02x core %02x%02x custom %02x%02x param %02x%02x\n",
++		    ver[1], ver[0], ver[3], ver[2], ver[5], ver[4], ver[7], ver[6]);
++	}
++	if (!ok) {
++		printf("A50 TOUCH: controller not answering; polling anyway\n");
++	}
++	if (kernel_thread_start(at_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++		printf("A50 TOUCH: polling every 10 ms, scale %dx%d -> %dx%d\n",
++		    at_res_x, at_res_y, A50_PANEL_W, A50_PANEL_H);
++	}
++}
++#endif /* ARM64_BOARD_CONFIG_A50 */
+diff --git a/iokit/Kernel/arm/hid/SweetHID.cpp b/iokit/Kernel/arm/hid/SweetHID.cpp
+index 61aaef9..26cb52b 100644
+--- a/iokit/Kernel/arm/hid/SweetHID.cpp
++++ b/iokit/Kernel/arm/hid/SweetHID.cpp
+@@ -434,7 +434,13 @@ SweetHIDTouch::start(IOService *provider)
+ 	}
+ 	int native = 0;
+ 	PE_parse_boot_argn("sweetfb_native", &native, sizeof(native));
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_A50)
++	/* bsd/dev/a50_touch.c reports 1080x2340 panel pixels (AppleCLCD's size). */
++	fPanelW = 1080;
++	fPanelH = 2340;
++	fLogicalW = native ? 1080 : 1125;
++	fLogicalH = native ? 2340 : 2436;
++#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	/* sec_ts reports 1440x2560 panel pixels; same geometry as AppleCLCD. */
+ 	fPanelW = 1440;
+ 	fPanelH = 2560;
+@@ -469,7 +475,11 @@ SweetHIDTouch::start(IOService *provider)
+ 	fOffY = (fLogicalH - fPanelH) / 2;
+ 	/* The digitizer covers the main display (backboardd maps it 1:1). */
+ 	setProperty("DisplayIntegrated", kOSBooleanTrue);
+-#if defined(ARM64_BOARD_CONFIG_HEROLTE)
++#if defined(ARM64_BOARD_CONFIG_A50)
++	/* 6.4" 1080x2340: about 68 x 148 mm. */
++	setProperty("SurfaceWidth", (unsigned long long)(68 << 16), 32);	/* mm, 16.16 */
++	setProperty("SurfaceHeight", (unsigned long long)(148 << 16), 32);
++#elif defined(ARM64_BOARD_CONFIG_HEROLTE)
+ 	setProperty("SurfaceWidth", (unsigned long long)(64 << 16), 32);	/* mm, 16.16 */
+ 	setProperty("SurfaceHeight", (unsigned long long)(113 << 16), 32);
+ #else
+diff --git a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+index 47f8964..ea4d164 100644
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -784,9 +784,14 @@ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+ 	 *
+ 	 * Keys: bsd/dev/a5xelte_keys.c with the A50 table (ALIVE 0x11850000,
+ 	 * GPA1 pins 7/5/6 = Power/Vol+/Vol-), read only; boot-arg a5keys=0 off.
++	 * Touch: bsd/dev/a50_touch.c, Melfas MSS100 on I2C-4 (a50touch=0 off).
+ 	 */
+ 	a5xelte_keys_init();
+ 	{
++	extern void a50_touch_probe(void);
++	a50_touch_probe();
++	}
++	{
+ 	uint32_t ufsprobe = 0;
+ 	PE_parse_boot_argn("ufsprobe", &ufsprobe, sizeof(ufsprobe));
+ 	if (ufsprobe == 1) {
