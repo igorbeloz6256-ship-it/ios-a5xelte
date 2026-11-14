@@ -474,6 +474,21 @@
   regulator-fixed 3,0 В по **GPIO gpg3-1** (active high); IRQ — gpa0-0;
   SCL/SDA — gpp1-1/gpp1-0. Нужно: адреса банков gpg3/gpp1/gpa0, тактирование
   I2C-4, протокол MSS100 (вероятно MIP4).
+- Коммит `6b8e264` (0403), сборка 43604170767 — success. `xnu9`: ядро
+  17386496 байт (SHA256SUMS OK, строки `A50 GPA1 con` и `Cortex-A73`), ADT
+  с 8 CPU, cmdline как xnu8 (`cpus=8`); `boot.img` sha256 `eae6bc2b…ac9d`,
+  хост-прогон проходит.
+- xnu9 на телефоне (20:12): **кнопки не работают**. Журнал:
+  `A5XELTE KEYS: A50 GPA1 con=0 dat=0x4f pud=0x111111`, ни одного
+  `key=`. В TWRP (debugfs, только чтение) Linux показывает банки ALIVE:
+  **etc0 (6 выводов), gpa0, gpa1, gpa2, gpq0**; у gpa1-5/6/7 `CON(0xf)
+  DAT(0x1) PUD(0x0)` (отпущены = 1). Исходник ядра A50
+  (`pinctrl-exynos-arm64.c`, `exynos9610_pin_banks0`): etc0 `0x000`, gpa0
+  `0x020`, **gpa1 `0x040`**, gpa2 `0x060`, gpq0 `0x080`; поля CON/PUD по 4
+  бита, DAT по 1. Мой драйвер читал gpa0. Исправлено в `0403` (GPA1 =
+  `0x40/0x44/0x48`), патч пересобран и ложится поверх 0402.
+- Попутно для тача: gpa0-0 (IRQ тача по DTS) в Linux `CON(0xf) DAT(0x1)
+  PUD(0x0)`.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon
