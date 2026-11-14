@@ -558,9 +558,45 @@
   середина свободна под вырез камеры). `mesa-ios.yml` собирается и на `a50`.
 - `E:\iOS-A50\flash\drop\` (вне git): `wallpaper.png` 1080×2340 (растянута из
   присланных 376×816), `statusbar.provider`.
+- Коммит `78f5607`: сборки xnu 43631270076 и mesa-ios 43631270223 — success.
+  `xnu13`: ядро (SHA256SUMS OK, `HERODRP1` внутри); `mesa-ios`: все 9 файлов
+  по SHA256SUMS OK (пути с префиксом `out/`), в `libherosb.dylib` есть
+  `statusbar.provider`. `libdrm.2.dylib` без конструкторов, к HeroGPU — только
+  из своих функций. `xnu13\boot.img` (ADT xnu12, cmdline + `herosb=1`),
+  sha256 `fe0f8fe6…4b49`, хост-прогон проходит.
+- Пакет drop zone записан (`herolte-drop.py --dev /dev/block/by-name/userdata`):
+  `lib/libherosb.dylib`, `lib/libdrm.2.dylib`, `wallpaper.png`,
+  `statusbar.provider`; package 1794685348, 1388544 байта, блок 13711359
+  (= 13745152 − 1025 − 32768, далеко за 5242880 блоками HFSX), **verified**.
+  xnu13 записан (чтение обратно совпало), reboot 22:42:39.
 - Камера: не делаем — сенсоры A50 идут через ISP Exynos с закрытой прошивкой,
   а камера iOS говорит с драйвером ISP Apple по закрытому протоколу; у S7
   камер тоже нет.
+- **xnu13 + пакет: ни шторки, ни обоев.** В логе: `HEROLTE DROP: package
+  1794685348: 5 entries written`, `HEROLTE GL: SpringBoard launch 1 (pid
+  27): libherosb inserted`, `SWEET AMFI: dyld policy for pid 27: input 0x0
+  -> 0x23`, но ни одной строки `herosb:`. Причина слепоты: `herodrm_log`
+  пишет только в user client HeroGPU (Mali S7), а на A50 его нет; копия в
+  stderr SpringBoard никуда не попадает. Загрузилась ли библиотека и
+  сработали ли хуки, не видно. Зависимость `@rpath/libdrm.2.dylib` с
+  rpath `/private/var/herolte/lib` есть, и AMFI разрешает @-пути (0x23).
+- **0406 (журнал из userland):** на A50 `log_data` (syscall 533) с tag
+  `'HER0'` (0x48455230) печатает строку в журнал ядра как `HEROLTE USER pid
+  имя: ...`, не больше 4000 строк за загрузку. `herodrm_log` без HeroGPU
+  вызывает его напрямую (`svc #0x80`); ядро S7 отвечает EPERM. herosb
+  пишет первой строкой `herosb: in pid N, ...`.
+- **Шторка, второй путь: экран iPhone XR.** 360×780 pt при @3x не совпадает
+  ни с одним iPhone, поэтому UIKit берёт провайдер Fallback с любым subtype.
+  `mkadt_a50.py --bank2 --xr`: 828×1792 @2x (414×896 pt, subtype 1792,
+  `chosen/display-scale` 2), как `--scale2` у S7. 19.5:9 совпадает с панелью,
+  поэтому без полос. Ядро уже умеет это делать (`sweetfb_scale=1
+  sweetfb_lw=828 sweetfb_lh=1792`). CoreAnimation рисует в свои IOSurface (2/3
+  в логе xnu13, кэшируемая память), `scaledCopy` растягивает кадр ×1.304
+  ближайшим соседом на всю панель. Кадр по умолчанию лежит в `0xa0000000`, в
+  нижнем окне, которое при `--bank2` свободно. `sweetfb_native=1` остаётся:
+  с ним SweetHID нормализует тач по всей панели. На CPU рисуется на 41%
+  меньше пикселей. Хуки шторки herosb выключаются файлом `gestures.off`
+  (жесты и так родные, home-button-type 2 из D22AP), обои остаются.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon

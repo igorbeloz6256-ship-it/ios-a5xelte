@@ -113,6 +113,27 @@ call(uint32_t sel, const uint64_t *in, uint32_t nin, uint64_t *out, uint32_t nou
 
 static int connect_gpu(void);
 
+/*
+ * No HeroGPU (the Galaxy A50 has no Mali driver): the line goes to log_data (syscall 533) with tag 'HER0', which the A50
+ * kernel prints (xnu patch 0406), so libherosb's lines in SpringBoard still reach the USERDATA log. The S7's kernel
+ * answers EPERM and nothing happens.
+ */
+static void
+kernel_line(const char *line, int n)
+{
+#if defined(__aarch64__)
+   register long x0 __asm__("x0") = 0x48455230;
+   register long x1 __asm__("x1") = 0;
+   register long x2 __asm__("x2") = (long)line;
+   register long x3 __asm__("x3") = n;
+   register long x16 __asm__("x16") = 533;
+   __asm__ volatile("svc #0x80" : "+r"(x0), "+r"(x1) : "r"(x2), "r"(x3), "r"(x16) : "memory", "cc");
+#else
+   (void)line;
+   (void)n;
+#endif
+}
+
 EXPORT void
 herodrm_log(const char *fmt, ...)
 {
@@ -129,6 +150,8 @@ herodrm_log(const char *fmt, ...)
       connect_gpu();    /* a test's first lines; not under the lock */
    if (conn)
       IOConnectCallMethod(conn, SEL_LOG, NULL, 0, line, n, NULL, NULL, NULL, NULL);
+   else if (n > 0)
+      kernel_line(line, n);
    fprintf(stderr, "herodrm: %s\n", line);
 }
 

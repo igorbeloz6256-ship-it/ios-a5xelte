@@ -258,9 +258,12 @@ herosb_start(void)
       raise_frame_rates();
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);
    }
-   if (access(DROP_DIR "gestures.off", F_OK) != 0)
+   bool gestures = access(DROP_DIR "gestures.off", F_OK) != 0, wallpaper = access(DROP_DIR "wallpaper.off", F_OK) != 0;
+   herodrm_log("herosb: in pid %d, status bar and gestures %s, wallpaper %s", getpid(), gestures ? "hooked" : "off",
+      wallpaper ? "on" : "off");
+   if (gestures)
       ask_for_gestures();
-   if (access(DROP_DIR "wallpaper.off", F_OK) == 0)
+   if (!wallpaper)
       return;
    dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, look_at_windows);
 }

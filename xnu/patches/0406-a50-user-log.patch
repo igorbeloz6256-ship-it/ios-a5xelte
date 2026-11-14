@@ -1,0 +1,38 @@
+diff --git a/bsd/kern/sys_generic.c b/bsd/kern/sys_generic.c
+index 66a3528..f91f298 100644
+--- a/bsd/kern/sys_generic.c
++++ b/bsd/kern/sys_generic.c
+@@ -2426,6 +2426,33 @@ log_data(__unused struct proc *p, struct log_data_args *args, int *retval)
+ 	int ret = 0;
+ 	*retval = 0;
+ 
++#if defined(ARM64_BOARD_CONFIG_A50)
++	/*
++	 * Galaxy A50: no HeroGPU, so herodrm_log() (gpu/mesa/herodrm.c) of the drop zone's libraries in SpringBoard and
++	 * backboardd has no user client to write to. Tag 'HER0' prints one line instead, at most 4000 a boot.
++	 */
++	if (tag == 0x48455230) {
++		static uint32_t a50_user_lines;
++		char line[256];
++		unsigned int n = size < sizeof(line) - 1 ? size : (unsigned int)sizeof(line) - 1;
++		if (n == 0) {
++			return EINVAL;
++		}
++		if (os_atomic_inc_orig(&a50_user_lines, relaxed) >= 4000) {
++			return ENOSPC;
++		}
++		if (copyin(buffer, line, n) != 0) {
++			return EFAULT;
++		}
++		while (n > 0 && (line[n - 1] == '\n' || line[n - 1] == '\0')) {
++			n--;
++		}
++		line[n] = '\0';
++		printf("HEROLTE USER %d %s: %s\n", proc_selfpid(), proc_best_name(current_proc()), line);
++		return 0;
++	}
++#endif
++
+ 	/* Only DEXTs are suppose to use this syscall. */
+ 	if (!task_is_driver(current_task())) {
+ 		return EPERM;

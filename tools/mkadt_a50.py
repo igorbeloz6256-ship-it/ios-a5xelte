@@ -49,8 +49,19 @@ def child(node, name, required=True):
     return None
 
 
-def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=2340):
+def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=2340, xr=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
+    scale = 3
+    if xr:
+        # --xr: a whole iPhone XR screen, 414x896 points at @2x (828x1792), as
+        # mkadt_herolte.py --scale2. 360x780 points at @3x is no iPhone's, and
+        # UIKit drew the red rdar:45025538 status bar with any subtype; the
+        # XR's 19.5:9 is the panel's, so the kernel scales it onto the whole
+        # panel (boot-args sweetfb_native=1 sweetfb_scale=1 sweetfb_lw=828
+        # sweetfb_lh=1792: SweetHID keeps normalizing over the panel), and
+        # CoreAnimation's CPU renderer draws 41% fewer pixels.
+        set_prop(child(root, 'chosen'), 'display-scale', mkadt.u32(2))
+        subtype, scale, canvas = 1792, 2, (828, 1792)
     # compatible[0]/model: the iPhone X userland (D22AP), as on herolte.
     # 'samsung,a5xelte' keeps SweetPlatformExpert's IONameMatch.
     set_prop(root, 'compatible', mkadt.cstr('D22AP') + mkadt.cstr('iPhone10,3') +
@@ -72,7 +83,7 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=234
         # the red rdar:45025538 bar (mkadt_herolte.py, herosb.c); 2340 is the
         # 12 mini's artwork-device-subtype.
         set_prop(product, 'artwork-device-subtype', mkadt.u32(subtype))
-        set_prop(product, 'artwork-scale-factor', mkadt.u32(3))
+        set_prop(product, 'artwork-scale-factor', mkadt.u32(scale))
 
     # Logical 0..3: Cortex-A53, MPIDR 0x0..0x3 (boot cluster); 4..7:
     # Cortex-A73, MPIDR 0x100..0x103 (exynos9610.dts; A50 kernel patch 0402,
@@ -157,11 +168,16 @@ if __name__ == '__main__':
                         help='XNU RAM = the second bank (below uH EL2_EARLYMEM) instead of 512 MiB at 0x90000000')
     parser.add_argument('--subtype', type=int, default=2340,
                         help='/product artwork-device-subtype (2340 = iPhone 12 mini, 2436 = iPhone X)')
+    parser.add_argument('--xr', action='store_true',
+                        help='iPhone XR screen, 828x1792 @2x, scaled to the panel (needs --bank2: '
+                             'the kernel keeps the drawn frame at 0xa0000000)')
     parser.add_argument('--dump', action='store_true')
     args = parser.parse_args()
     canvas = tuple(int(v) for v in args.canvas.lower().split('x'))
+    if args.xr and not args.bank2:
+        parser.error('--xr needs --bank2: the scaled frame lives at 0xa0000000, inside the low RAM window')
     dram = (BANK2_BASE, BANK2_SIZE) if args.bank2 else (DRAM_BASE, DRAM_SIZE)
-    blob = adt.serialize(build(canvas, dram, args.subtype))
+    blob = adt.serialize(build(canvas, dram, args.subtype, args.xr))
     args.output.write_bytes(blob)
     if args.dump:
         adt.dump(adt.parse(blob)[0])
