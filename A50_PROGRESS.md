@@ -667,6 +667,27 @@
   (MAX77854 S7) на A50 больше не собирается. `a50fg=0` оставляет статичные
   100 %. Процент — сырой SOC топливомера; Android ещё масштабирует его
   (capacity_max), поэтому числа могут расходиться на несколько процентов.
+- Коммит `783db1a`: xnu 43714850920 — success, SHA256SUMS OK, строки
+  `A50 BATTERY` и `SM5713 fuel gauge` в ядре. `xnu16\boot.img` (ADT и cmdline
+  xnu15), sha256 `9a732c6b…aecb`, хост-прогон проходит. Записан в BOOT (чтение
+  обратно совпало), reboot 2026-11-15 17:10:28.
+- **xnu16 на телефоне: батарея правильная** (пользователь: «батарея работает
+  корректно», но кабель отображается с задержкой 40–60 с). Лог
+  `boot-xnu16.txt`: `before: gpp0 con=0x1111 pud=0x11110000 i2c con=0xa`
+  (S-Boot оставил gpp0-2/3 как GPIO-выходы), `I2C1 reads with a repeated
+  START`, `SM5713 id 0x1, SOC 0x6400 = 100.0%, VBAT 0x229f = 4327 mV, current
+  0xc5 = 96 mA; charger read vbus=1 charging=1`, потом без кабеля `99% 4188mV
+  -380mA vbus=0`. TWRP после этого: 100 %, Full, 4343000 мкВ.
+- **0409:** на A50 SweetBattery каждые 2 с читает два байта статуса
+  зарядника, а полный опрос делает при их изменении или раз в 30 с. Строка
+  в логе: `SWEET BATTERY: charger now vbus=… charging=… done=…`.
+- **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
+  (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
+  ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)
+  и драйверами scsc_mx/scsc_bt (общая память и mailbox). А bluetoothd/BlueTool в
+  iOS ждут контроллер Broadcom/Apple с его vendor-командами. Пришлось бы
+  перенести в XNU стек Samsung и подделать для iOS чип Broadcom. У S7 BT
+  тоже нет; bluetoothd выключен через `heronoexec`.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon
