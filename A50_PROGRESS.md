@@ -630,6 +630,20 @@
   `sm5713-fuelgauge`/`sm5713-charger`, MFD `sm5713mfd` на i2c-1 по адресу 0x49,
   dummy 0x25 и 0x71; `battery`: 100%, 4312000 мкВ, Full (на USB). i2c-1 —
   `s3c2410-i2c`, как у тача.
+- Коммит `ca36f14`: xnu 43641718200 — success, SHA256SUMS OK, строка 0407 в
+  ядре. `xnu15\boot.img` (ADT и cmdline xnu14), sha256 `0b725a53…24da`,
+  хост-прогон проходит. Пакет не переписывался (1794688563 уже установлен,
+  а исправление режима работает до проверки id). xnu15 записан в BOOT (чтение
+  обратно совпало), reboot 2026-11-15 14:30:54.
+- **xnu15 на телефоне: обои работают** (пользователь: «обои работают
+  хорошо»). В логе `boot-xnu15.txt`: `HEROLTE DROP: /private/var/herolte
+  mode 744 -> 755 (0)`, `package 1794688563 already installed`, и строки herosb
+  через 0406: `HEROLTE USER 27 SpringBoard: herosb: in pid 27, status bar and
+  gestures off, wallpaper on`, `round 1, 14 windows, picture 1`, `picture in
+  SBHomeScreenWindow, 414 x 896`, `picture in _SBWallpaperSecureWindow, 414 x
+  896`; ограничения частоты кадров подняты до 60 (fluid/animation settings yes).
+  Шторка нормальная при выключенных хуках herosb: её рисует сам UIKit для
+  экрана XR.
 
 - `tools/mkadt_a50.py`: ADT без файлов Apple (без `/product`) собирается,
   проверено чтением обратно: GIC `0x12301000`/`0x12302000`, fbcon
