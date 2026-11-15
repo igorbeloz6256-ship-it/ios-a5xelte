@@ -773,6 +773,28 @@
 - **Зарядка под iOS ниже 100 % работает** (пользователь проверил). Значит,
   остановка заряда при 100 % в `boot-xnu17.txt` — обычное окончание, а не
   сторожевой таймер зарядника.
+
+### Звук и вибрация: разведка (2026-11-15)
+
+- **Вибромотор:** `sec_vib` в живом DT, `sec_vib,ldo_en` = phandle 0xad
+  (**gpa2**, ALIVE `0x11850000` + 0x060) вывод **1**, `ldo_type` 1,
+  `max_timeout` 10000 мс. TWRP: `echo 500 > /sys/class/timed_output/vibrator/enable`
+  — `gpa2-1 CON(0x1) DAT(0x1)` во время вибрации, DAT 0 после. Мотор включается
+  одним выводом.
+- **Как iOS 16 вибрирует** (строки корня): нет AppleVibrator/IOHIDVibrator;
+  клиенты идут в `com.apple.audio.SystemSoundServer-iOS`
+  (`kAudioServicesPlaySystemSoundOptionVibrationPatternKey`) и
+  `com.apple.audio.hapticd`; у iPhone X Taptic Engine питается через аудиотракт
+  (`HapticAudioUnit`, `HapticsAmpTurnOn`, `ConfigureTDMControls`,
+  `AppleHapticsSupport`, `audio-haptic` в ADT). На телефоне запущен
+  `mediaserverd` (audiomxd нет), в нём и живут эти службы.
+- **Звук, iOS:** на S7 уже работает модуль `gpu/hakios-audio`
+  (AudioServerPlugIn в mediaserverd → `/dev/hakios-audio`, синк ядра, громкость).
+- **Звук, железо A50:** ABOX `0x14A50000` (DSP «calliope» со своей прошивкой,
+  в TWRP `calliope_version` пустой; RDMA ×8, WDMA ×5, UAIF ×4, IPC), карта
+  `Exynos9610-Audio`; динамик через усилитель `tfa98xx` (I2C-7, 0x34, ему нужна
+  своя конфигурация), кодек `rt5665` (I2C-6, 0x1b). Это несравнимо больше, чем
+  I2S на S7.
 - **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
   (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
   ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)
