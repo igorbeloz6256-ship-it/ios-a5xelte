@@ -693,6 +693,52 @@
   драйвера Android никто не сбрасывает сторожевой таймер зарядника SM5713
   (бит 7 STATUS2 в Linux), и пока неясно, не он ли остановил заряд. Проверить
   при заряде ~80–90 %: `charging=1` и ток > 0 в строках SWEET BATTERY.
+
+### Фонарик и яркость (0410, 2026-11-15)
+
+- **Как iOS это делает** (поиск строк по распакованному образу корня, без
+  вывода файлов Apple): CoreBrightness (`CBDisplayContaineriOS`) и
+  `PLDisplayAgent` ждут службу **`AppleARMBacklight`** с
+  `{"backlight-control" = true}`. Они читают и пишут её `IODisplayParameters` →
+  `brightness` / `BrightnessMilliNits` (`{min,max,value}`), а CoreBrightness
+  ещё задаёт `IOMFBBrightnessLevel` (`_SetIOMFBBrightness`,
+  `SetBLDriverNitsValue`). В порте такой службы не было. Фонарик — это
+  `AVFlashlight` (`+hasFlashlight`, `available`, `overheated`,
+  `flashlightLevel`, `setFlashlightLevel:withError:`,
+  `turnPowerOnWithError:`, `turnPowerOff`). Без камеры `hasFlashlight` = NO
+  («AVFlashlight cannot be instantiated on this platform…»).
+- **Панель:** EA8076 (TWRP: `ea8076_read_id: 904003`, `lcdtype=9453571`),
+  командный режим MIPI, DSIM `0x148E0000`. Яркость в ядре Samsung
+  (`ea8076_a50_lcd_ctrl.c`): `F0 5A 5A`, `51 hi lo` (10 бит), `F0 A5 A5`,
+  каждая — DCS long write 0x39. `brightness_table` в TWRP: UI 0..255 → 3..1023
+  почти линейно, выше 255 — HBM. Регистры DSIM (`cal_9610/regs-dsim.h`):
+  PKTHDR 0x58, PAYLOAD 0x5C, FIFOCTRL 0x68 (бит 10 — FIFO заголовков пуст),
+  INTSRC 0x50.
+- **Фонарик, TWRP** (`echo 1/0 > /sys/class/camera/flash/rear_flash`,
+  `i2cget -f -y 1 0x49`): `0x41` 0x1c → **0x1f** → 0x1c (биты 1:0 — режим),
+  `0x42` 0x28 → **0x18** (биты 6:4 — ток, 50 + 25·код мА); `0x14` 0x05 и `0x23`
+  0x31 не менялись (на USB). Выводы при горящем светодиоде: `gpa1-3`
+  (torch-gpio) CON 1 DAT **1**, `gpg0-6` (flash-gpio) CON 1 DAT 0
+  (`fimc-is-flash-gpio@0` в живом DT). `sm5713_charger_oper.c`: без VBUS
+  фонарик = op mode **8** (FLASH_BOOST) в `0x14`[3:0], BSTOUT 4500 мВ (1) и OTG
+  900 мА (1) в `0x23` [3:0]/[7:6]; без событий и с VBUS — 5 (CHG_ON_VBUS),
+  4500 мВ, 500 мА. Банк gpg0 в TOP — `0x0c0` (gpp0…gpc2 перед ним, шаг 0x20,
+  gpg3 = 0x120 сходится с тачем).
+- **0410:** `bsd/dev/a50_torch.c` — sysctl `kern.a50_torch` 0..100 (любой
+  пользователь), уровень → код 1..4 (75–150 мА), режим зарядника по VBUS,
+  перепроверка при смене кабеля (из 2-секундной проверки SweetBattery).
+  `a50_battery.c`: блокировка I2C-1 и запись байта. `bsd/dev/a50_panel.c` —
+  три DCS-команды через DSIM; после трёх неудач подряд панель не трогается.
+  `iokit/Kernel/arm/A50Backlight.cpp` — служба `AppleARMBacklight`: свойства
+  `/backlight` iPhone X (ADT), `backlight-control`, `IODisplayParameters`;
+  `setProperties` (у неё и у AppleCLCD) пишет в лог всё, что приходит, и
+  переводит `BrightnessMilliNits` / `brightness` / `IOMFBBrightnessLevel` в
+  уровень панели (500 нит = 1023, предположение). Селекторы IOMFB 50/66/67/68
+  пишутся в лог со значениями. При старте службы яркость ставится на 60 %.
+- `mkadt_a50.py`: в ADT добавляется `/backlight` из D22AP (без phandle и
+  `function-*`). `herosb.c`: в SpringBoard методы `AVFlashlight` отвечают сами
+  и передают уровень в `kern.a50_torch` — только если этот sysctl есть;
+  `flashlight.off` выключает.
 - **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
   (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
   ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)

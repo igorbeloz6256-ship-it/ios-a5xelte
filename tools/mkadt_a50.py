@@ -49,6 +49,21 @@ def child(node, name, required=True):
     return None
 
 
+def d22ap_backlight(path=mkadt.D22AP_ADT):
+    """/backlight of the real D22AP tree (the iPhone X's brightness calibration: max-nit-value, DBVMax...), for
+    the kernel's AppleARMBacklight (iokit/Kernel/arm/A50Backlight.cpp) to show to CoreBrightness. An Apple
+    artifact like /product: the ADT built here stays out of git. No phandle, no function-* (they name nodes
+    this tree does not have)."""
+    if not os.path.exists(path):
+        return None
+    root, _ = adt.parse(open(path, 'rb').read())
+    for c in root.children:
+        if dict((k, v) for k, f, v in c.props).get('name') == b'backlight\0':
+            return [(k, v) for k, f, v in c.props
+                    if not f and k not in ('name', 'AAPL,phandle') and not k.startswith('function-')]
+    return None
+
+
 def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=2340, xr=False):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     scale = 3
@@ -149,6 +164,9 @@ def build(canvas=(FB_WIDTH, FB_HEIGHT), dram=(DRAM_BASE, DRAM_SIZE), subtype=234
     root.children.append(mkadt.node('a50-ufs', [
         ('reg', mkadt.u64(UFS_BASE, UFS_MAP)),
     ]))
+    backlight = d22ap_backlight()
+    if backlight is not None:
+        root.children.append(mkadt.node('backlight', backlight))
     # pe_serial.c looks this node up by name for the kprintf console.
     root.children.append(mkadt.node('a5xelte-fbcon', [
         ('reg', mkadt.u64(FB_BASE, FB_WIDTH * FB_HEIGHT * 4)),

@@ -1,0 +1,792 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index b123c60..6b1b7f8 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -120,6 +120,8 @@ bsd/dev/a5xelte_keys.c			standard
+ bsd/dev/a5xelte_touch.c			standard
+ bsd/dev/a50_touch.c			standard
+ bsd/dev/a50_battery.c			standard
++bsd/dev/a50_torch.c			standard
++bsd/dev/a50_panel.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a50_battery.c b/bsd/dev/a50_battery.c
+index a88a615..d9b264b 100644
+--- a/bsd/dev/a50_battery.c
++++ b/bsd/dev/a50_battery.c
+@@ -18,13 +18,16 @@
+  * byte of 4309 mV * 2048 / 1000 = 0x2278); 0x49: STATUS1 0x01, STATUS2 0x20.
+  *
+  * Writes: only the gpp0-2/3 fields (read-modify-write) and the I2C-1
+- * controller; the SM5713 only gets register addresses. Boot-arg a50fg=0
+- * keeps SweetBattery's static 100 %.
++ * controller; for the battery the SM5713 only gets register addresses.
++ * Boot-arg a50fg=0 keeps SweetBattery's static 100 %. The rear flash LED's
++ * registers (bsd/dev/a50_torch.c) are written through a50_sm5713_update(),
++ * under the same lock as every read here.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A50)
+ #include <sys/param.h>
+ #include <sys/systm.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+ 
+@@ -32,6 +35,11 @@ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ int herolte_fg_init(void);
+ int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma, unsigned *rem_mah, unsigned *full_mah);
+ int a50_charger_read(int *vbus, int *charging, int *full);
++int a50_sm5713_read(uint8_t chip, uint8_t reg, uint8_t *value);
++int a50_sm5713_update(uint8_t chip, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *was);
++
++static LCK_GRP_DECLARE(a50_i2c1_grp, "a50_i2c1");
++static LCK_MTX_DECLARE(a50_i2c1_lock, &a50_i2c1_grp);
+ 
+ #define A50_TOP_PINCTRL_PA      0x139b0000u
+ #define A50_GPP0                0x000u          /* i2c1: SDA pin 2, SCL pin 3 */
+@@ -217,7 +225,7 @@ out:
+ 
+ /* SMBus-style read: repeated START, as Linux does; STOP between if the first one ever fails. */
+ static bool
+-ab_reg(uint8_t chip, uint8_t reg, uint8_t *bytes, unsigned count)
++ab_reg_locked(uint8_t chip, uint8_t reg, uint8_t *bytes, unsigned count)
+ {
+ 	if (ab_restart != 0 && ab_read(chip, reg, bytes, count, true)) {
+ 		if (ab_restart < 0) {
+@@ -236,6 +244,73 @@ ab_reg(uint8_t chip, uint8_t reg, uint8_t *bytes, unsigned count)
+ 	return false;
+ }
+ 
++static bool
++ab_reg(uint8_t chip, uint8_t reg, uint8_t *bytes, unsigned count)
++{
++	lck_mtx_lock(&a50_i2c1_lock);
++	bool ok = ab_reg_locked(chip, reg, bytes, count);
++	lck_mtx_unlock(&a50_i2c1_lock);
++	return ok;
++}
++
++/* SMBus byte write: register address and value in one message, then STOP. */
++static bool
++ab_write_locked(uint8_t chip, uint8_t reg, uint8_t value)
++{
++	const uint8_t bytes[2] = { reg, value };
++	bool ok = false;
++	if (!ab_idle() || !ab_address(chip, false, false)) {
++		goto out;
++	}
++	for (unsigned n = 0; n < 2; n++) {
++		ab_wr(ab_i2c, IICDS, bytes[n]);
++		delay(1);
++		ab_clear_irq();
++		if (!ab_wait_irq()) {
++			ab_fail("write timeout", n);
++			goto out;
++		}
++		if (ab_rd(ab_i2c, IICSTAT) & 1u) {
++			ab_fail("write NACK", n);
++			goto out;
++		}
++	}
++	ok = true;
++out:
++	ab_stop();
++	return ok;
++}
++
++int
++a50_sm5713_read(uint8_t chip, uint8_t reg, uint8_t *value)
++{
++	if (ab_i2c == 0) {
++		return -1;
++	}
++	return ab_reg(chip, reg, value, 1) ? 0 : -1;
++}
++
++/* Read-modify-write of one byte register; *was gets the old value. Nothing is written when the bits already match. */
++int
++a50_sm5713_update(uint8_t chip, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *was)
++{
++	uint8_t old = 0;
++	int ret = -1;
++	if (ab_i2c == 0) {
++		return -1;
++	}
++	lck_mtx_lock(&a50_i2c1_lock);
++	if (ab_reg_locked(chip, reg, &old, 1)) {
++		uint8_t now = (uint8_t)((old & ~mask) | (value & mask));
++		ret = (now == old || ab_write_locked(chip, reg, now)) ? 0 : -1;
++	}
++	lck_mtx_unlock(&a50_i2c1_lock);
++	if (was != NULL) {
++		*was = old;
++	}
++	return ret;
++}
++
+ static bool
+ ab_word(uint8_t reg, uint16_t *value)
+ {
+diff --git a/bsd/dev/a50_panel.c b/bsd/dev/a50_panel.c
+new file mode 100644
+index 0000000..e68b726
+--- /dev/null
++++ b/bsd/dev/a50_panel.c
+@@ -0,0 +1,138 @@
++/*
++ * Galaxy A50 (SM-A505FN) panel brightness: DCS commands through the DSIM.
++ * The panel is MAGNA EA8076 (TWRP on this phone: "ea8076_read_id: 904003",
++ * MIPI command mode, DSIM at 0x148E0000), left running by S-Boot.
++ *
++ * From the A50 kernel (universal9610 drivers/video/fbdev/exynos/dpu20/):
++ *  - panels/ea8076_a50_lcd_ctrl.c low_level_set_brightness(): F0 5A 5A (test
++ *    key on), 51 hi lo (WRDISBV, 10 bits: hi = bits 9:8, lo = bits 7:0), F0
++ *    A5 A5 (test key off), each a DCS long write (data type 0x39);
++ *  - TWRP's /sys/class/lcd/panel/brightness_table: UI level 0..255 -> 3..1023,
++ *    nearly linear (above 255 is HBM, not used here);
++ *  - cal_9610/regs-dsim.h and dsim_reg.c: payload into DSIM_PAYLOAD 0x5c
++ *    (little-endian), then DSIM_PKTHDR 0x58 = ID | word count << 8; the
++ *    header FIFO is empty again (DSIM_FIFOCTRL 0x68 bit 10) once it is sent.
++ * Only these three commands are ever sent. After 3 failures in a row the
++ * panel is left alone for the rest of the boot.
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int a50_panel_set_permille(unsigned permille, const char *why);
++
++#define A50_DSIM_PA             0x148e0000u
++#define DSIM_INTSRC             0x50u
++#define DSIM_PKTHDR             0x58u
++#define DSIM_PAYLOAD            0x5cu
++#define DSIM_FIFOCTRL           0x68u
++#define FIFO_EMPTY_PL_SFR       (1u << 8)
++#define FIFO_FULL_PL_SFR        (1u << 9)
++#define FIFO_EMPTY_PH_SFR       (1u << 10)
++#define FIFO_FULL_PH_SFR        (1u << 11)
++#define INT_SFR_PH_FIFO_EMPTY   (1u << 28)
++#define DCS_LONG_WRITE          0x39u
++#define DBV_MIN                 3u
++#define DBV_MAX                 1023u
++
++static LCK_GRP_DECLARE(a50_panel_grp, "a50_panel");
++static LCK_MTX_DECLARE(a50_panel_lock, &a50_panel_grp);
++static vm_offset_t ap_dsim;
++static unsigned ap_failures, ap_lines, ap_last = ~0u;
++
++static uint32_t
++ap_rd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(ap_dsim + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++ap_wr(uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(ap_dsim + off) = v;
++}
++
++static bool
++ap_wait_sent(void)
++{
++	for (unsigned n = 0; n < 50000; n++) {           /* up to ~50 ms: a frame is 16.7 ms */
++		if (ap_rd(DSIM_FIFOCTRL) & FIFO_EMPTY_PH_SFR) {
++			return true;
++		}
++		delay(1);
++	}
++	return false;
++}
++
++/* One DCS long write of up to 4 bytes. */
++static bool
++ap_long(const uint8_t *b, unsigned n)
++{
++	if (!ap_wait_sent()) {
++		return false;
++	}
++	uint32_t payload = 0;
++	for (unsigned i = 0; i < n && i < 4; i++) {
++		payload |= (uint32_t)b[i] << (8 * i);
++	}
++	ap_wr(DSIM_INTSRC, INT_SFR_PH_FIFO_EMPTY);       /* write 1 to clear */
++	ap_wr(DSIM_PAYLOAD, payload);
++	ap_wr(DSIM_PKTHDR, DCS_LONG_WRITE | ((n & 0xffu) << 8) | (((n >> 8) & 0xffu) << 16));
++	return ap_wait_sent();
++}
++
++/* permille 0..1000 of the normal range (UI 0..255): WRDISBV 3..1023. */
++int
++a50_panel_set_permille(unsigned permille, const char *why)
++{
++	int ret = -1;
++	if (permille > 1000) {
++		permille = 1000;
++	}
++	unsigned dbv = DBV_MIN + (DBV_MAX - DBV_MIN) * permille / 1000;
++	lck_mtx_lock(&a50_panel_lock);
++	if (ap_failures >= 3) {
++		goto out;
++	}
++	if (ap_dsim == 0) {
++		ap_dsim = ml_io_map(A50_DSIM_PA, 0x1000);
++		if (ap_dsim == 0) {
++			ap_failures = 3;
++			goto out;
++		}
++		printf("A50 PANEL: DSIM fifoctrl=%#x intsrc=%#x\n", ap_rd(DSIM_FIFOCTRL), ap_rd(DSIM_INTSRC));
++	}
++	if (dbv == ap_last) {
++		ret = 0;
++		goto out;
++	}
++	{
++		static const uint8_t key_on[3] = { 0xf0, 0x5a, 0x5a }, key_off[3] = { 0xf0, 0xa5, 0xa5 };
++		const uint8_t bl[3] = { 0x51, (uint8_t)((dbv >> 8) & 0x03), (uint8_t)(dbv & 0xff) };
++		bool ok = ap_long(key_on, 3) && ap_long(bl, 3);
++		ok = ap_long(key_off, 3) && ok;
++		if (ok) {
++			ap_failures = 0;
++			ap_last = dbv;
++			ret = 0;
++		} else {
++			ap_failures++;
++		}
++		if (ap_lines++ < 60 || !ok) {
++			printf("A50 PANEL: brightness %u.%u%% -> WRDISBV %u (%s)%s fifoctrl=%#x\n", permille / 10, permille % 10,
++			    dbv, why, ok ? "" : " FAILED", ap_rd(DSIM_FIFOCTRL));
++		}
++	}
++out:
++	lck_mtx_unlock(&a50_panel_lock);
++	return ret;
++}
++#endif /* ARM64_BOARD_CONFIG_A50 */
+diff --git a/bsd/dev/a50_torch.c b/bsd/dev/a50_torch.c
+new file mode 100644
+index 0000000..47cb32c
+--- /dev/null
++++ b/bsd/dev/a50_torch.c
+@@ -0,0 +1,176 @@
++/*
++ * Galaxy A50 (SM-A505FN) rear flash LED as a torch: the SM5713's FLED1 in
++ * external mode, lit by its torch-enable pin. sysctl kern.a50_torch = 0..100
++ * (any user: libherosb in SpringBoard answers iOS's AVFlashlight with it,
++ * gpu/eagl/src/herosb.c).
++ *
++ * From the A50 kernel (universal9610 drivers/leds/leds-sm5713-fled.c,
++ * drivers/battery_v2/sm5713_charger_oper.c, include/linux/mfd/sm5713-private.h)
++ * and TWRP on this phone (echo 1 > /sys/class/camera/flash/rear_flash, then 0):
++ *  - charger I2C 0x49: FLED1CNTL1 0x41 bits 1:0 = mode (TWRP: 0x1c off,
++ *    0x1f on); FLED1CNTL2 0x42 bits 6:4 = torch current, 50 + 25 * code mA
++ *    (TWRP's "1": code 1, 0x28 -> 0x18);
++ *  - pins (fimc-is-flash-gpio in the live DT): torch-gpio gpa1-3 (ALIVE
++ *    0x11850000, gpa1 at 0x040), output high while lit; flash-gpio gpg0-6
++ *    (TOP 0x139B0000, gpg0 at 0x0c0), output low;
++ *  - without USB power the charger has to boost the battery for the LED:
++ *    op mode CNTL2 0x14 bits 3:0 = 8 (FLASH_BOOST), BSTCNTL1 0x23 bits 3:0 =
++ *    1 (4500 mV), bits 7:6 = 1 (900 mA); otherwise (torch off, or VBUS) 5
++ *    (CHG_ON_VBUS), 4500 mV, 500 mA -- the table of sm5713_charger_oper.c.
++ *    TWRP on USB: CNTL2 0x05, BSTCNTL1 0x31 before, during and after.
++ * Current: iOS's levels (0..1) -> code 1..4, 75..150 mA (Samsung's quick
++ * panel torch stays at or below 150 mA).
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++int a50_sm5713_read(uint8_t chip, uint8_t reg, uint8_t *value);
++int a50_sm5713_update(uint8_t chip, uint8_t reg, uint8_t mask, uint8_t value, uint8_t *was);
++void a50_torch_vbus_changed(int vbus);
++
++#define CHG_ADDR                0x49u
++#define CHG_STATUS1             0x0du
++#define CHG_CNTL2               0x14u
++#define CHG_BSTCNTL1            0x23u
++#define FLED1CNTL1              0x41u
++#define FLED1CNTL2              0x42u
++#define OP_MODE_CHG_ON_VBUS     0x5u
++#define OP_MODE_FLASH_BOOST     0x8u
++
++#define A50_ALIVE_PINCTRL_PA    0x11850000u
++#define A50_GPA1                0x040u          /* torch enable: pin 3 */
++#define A50_TOP_PINCTRL_PA      0x139b0000u
++#define A50_GPG0                0x0c0u          /* flash enable: pin 6 */
++#define PIN_CON                 0x00u
++#define PIN_DAT                 0x04u
++
++static LCK_GRP_DECLARE(a50_torch_grp, "a50_torch");
++static LCK_MTX_DECLARE(a50_torch_lock, &a50_torch_grp);
++static vm_offset_t tt_alive, tt_top;
++static int a50_torch_level;             /* 0..100, what was asked last */
++static bool tt_lit;
++static unsigned tt_lines;
++
++static uint32_t
++tt_rd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile ("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++tt_wr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	*(volatile uint32_t *)(base + off) = v;
++}
++
++/* One pin as an output at a level: DAT first, then CON's 4-bit field, as gpio_direction_output. */
++static void
++tt_pin(vm_offset_t base, uint32_t bank, unsigned pin, bool high)
++{
++	uint32_t dat = tt_rd(base, bank + PIN_DAT);
++	tt_wr(base, bank + PIN_DAT, high ? (dat | (1u << pin)) : (dat & ~(1u << pin)));
++	uint32_t con = tt_rd(base, bank + PIN_CON);
++	tt_wr(base, bank + PIN_CON, (con & ~(0xfu << (4 * pin))) | (1u << (4 * pin)));
++}
++
++/* The charger's op mode for the torch's state and USB power: the boost only with the torch on and no VBUS. */
++static int
++tt_power(bool torch, int vbus)
++{
++	bool boost = torch && !vbus;
++	int e = a50_sm5713_update(CHG_ADDR, CHG_BSTCNTL1, 0xcf, boost ? 0x41 : 0x01, NULL);
++	e |= a50_sm5713_update(CHG_ADDR, CHG_CNTL2, 0x0f, boost ? OP_MODE_FLASH_BOOST : OP_MODE_CHG_ON_VBUS, NULL);
++	return e;
++}
++
++static int
++tt_vbus(void)
++{
++	uint8_t s1 = 0;
++	return a50_sm5713_read(CHG_ADDR, CHG_STATUS1, &s1) == 0 ? (s1 & 1) : 1;
++}
++
++static void
++a50_torch_set(int level)
++{
++	lck_mtx_lock(&a50_torch_lock);
++	if (tt_alive == 0) {
++		tt_alive = ml_io_map(A50_ALIVE_PINCTRL_PA, 0x1000);
++		tt_top = ml_io_map(A50_TOP_PINCTRL_PA, 0x1000);
++	}
++	if (tt_alive == 0 || tt_top == 0) {
++		lck_mtx_unlock(&a50_torch_lock);
++		return;
++	}
++	int vbus = tt_vbus();
++	int e = 0;
++	if (level > 0) {
++		unsigned code = 1 + (unsigned)(level > 100 ? 100 : level) * 3 / 100;     /* 1..4: 75..150 mA */
++		e |= tt_power(true, vbus);
++		e |= a50_sm5713_update(CHG_ADDR, FLED1CNTL2, 0x70, (uint8_t)(code << 4), NULL);
++		if (!tt_lit) {
++			/* sm5713_fled_control(FLED_MODE_TORCH): torch pin low, external mode, then torch pin high, flash pin low. */
++			tt_pin(tt_alive, A50_GPA1, 3, false);
++			e |= a50_sm5713_update(CHG_ADDR, FLED1CNTL1, 0x03, 0x03, NULL);
++			tt_pin(tt_alive, A50_GPA1, 3, true);
++			tt_pin(tt_top, A50_GPG0, 6, false);
++			tt_lit = true;
++		}
++		if (tt_lines++ < 40) {
++			printf("A50 TORCH: on, level %d -> %u mA, vbus %d%s\n", level, 50 + 25 * code, vbus, e ? ", I2C FAILED" : "");
++		}
++	} else if (tt_lit) {
++		tt_pin(tt_alive, A50_GPA1, 3, false);
++		tt_pin(tt_top, A50_GPG0, 6, false);
++		e |= a50_sm5713_update(CHG_ADDR, FLED1CNTL1, 0x03, 0x00, NULL);
++		e |= tt_power(false, vbus);
++		tt_lit = false;
++		if (tt_lines++ < 40) {
++			printf("A50 TORCH: off%s\n", e ? ", I2C FAILED" : "");
++		}
++	}
++	a50_torch_level = level;
++	lck_mtx_unlock(&a50_torch_lock);
++}
++
++/* SweetBattery's 2 s charger check: a cable put in or taken out while the torch is lit moves the boost. */
++void
++a50_torch_vbus_changed(int vbus)
++{
++	lck_mtx_lock(&a50_torch_lock);
++	if (tt_lit) {
++		int e = tt_power(true, vbus);
++		if (tt_lines++ < 40) {
++			printf("A50 TORCH: vbus %d while lit%s\n", vbus, e ? ", I2C FAILED" : "");
++		}
++	}
++	lck_mtx_unlock(&a50_torch_lock);
++}
++
++static int
++sysctl_a50_torch SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int level = a50_torch_level, changed = 0;
++	int error = sysctl_io_number(req, level, sizeof(level), &level, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	a50_torch_set(level < 0 ? 0 : level);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, a50_torch, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_a50_torch, "I", "Galaxy A50 rear LED as a torch, 0..100");
++#endif /* ARM64_BOARD_CONFIG_A50 */
+diff --git a/iokit/Kernel/arm/A50Backlight.cpp b/iokit/Kernel/arm/A50Backlight.cpp
+new file mode 100644
+index 0000000..ef701bb
+--- /dev/null
++++ b/iokit/Kernel/arm/A50Backlight.cpp
+@@ -0,0 +1,220 @@
++/*
++ * Galaxy A50: the display's brightness for iOS. CoreBrightness
++ * (CBDisplayContaineriOS) and powerlog's PLDisplayAgent wait for an
++ * "AppleARMBacklight" service ({"backlight-control" = true}) and read and set
++ * its "IODisplayParameters" -> "brightness" / "BrightnessMilliNits"; CoreBrightness also sets
++ * "IOMFBBrightnessLevel" (strings of the iOS 16 dyld shared cache of this
++ * root). Without the service the Control Center slider moved nothing.
++ *
++ * Every value that comes in is logged (the first lines of each key), as the
++ * units iOS uses are not known yet; brightness is taken as a fraction of the
++ * published max, BrightnessMilliNits and IOMFBBrightnessLevel (16.16) as nits
++ * of A50_NITS_MAX for WRDISBV 1023 (bsd/dev/a50_panel.c). The iPhone X's
++ * /backlight calibration, copied into the device tree by mkadt_a50.py, is
++ * shown as the service's own properties, as Apple's driver does.
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#include <IOKit/IOService.h>
++#include <IOKit/IOLib.h>
++#include <IOKit/IODeviceTreeSupport.h>
++#include <libkern/c++/OSCollectionIterator.h>
++#include <libkern/c++/OSDictionary.h>
++#include <libkern/c++/OSNumber.h>
++#include <libkern/c++/OSData.h>
++#include <libkern/c++/OSString.h>
++#include <libkern/c++/OSSymbol.h>
++#include <libkern/c++/OSBoolean.h>
++
++extern "C" int a50_panel_set_permille(unsigned permille, const char *why);
++IOReturn a50_backlight_properties(OSObject *properties, const char *who);
++
++#define A50_NITS_MAX            500u            /* nits taken as WRDISBV 1023 (UI 255) */
++#define A50_BRIGHTNESS_MAX      65536u          /* "brightness" max published */
++#define A50_BOOT_PERMILLE       600u
++
++static unsigned a50_bl_lines;
++
++class AppleARMBacklight : public IOService {
++	OSDeclareDefaultStructors(AppleARMBacklight);
++public:
++	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++	void publish(unsigned permille);
++};
++
++OSDefineMetaClassAndStructors(AppleARMBacklight, IOService);
++
++static AppleARMBacklight *a50_backlight;
++
++static OSDictionary *
++a50_range(unsigned max, unsigned value)
++{
++	OSDictionary *d = OSDictionary::withCapacity(3);
++	if (d != NULL) {
++		OSNumber *n0 = OSNumber::withNumber(0ULL, 32), *n1 = OSNumber::withNumber(max, 32),
++		    *n2 = OSNumber::withNumber(value, 32);
++		if (n0 && n1 && n2) {
++			d->setObject("min", n0);
++			d->setObject("max", n1);
++			d->setObject("value", n2);
++		}
++		OSSafeReleaseNULL(n0);
++		OSSafeReleaseNULL(n1);
++		OSSafeReleaseNULL(n2);
++	}
++	return d;
++}
++
++void
++AppleARMBacklight::publish(unsigned permille)
++{
++	OSDictionary *params = OSDictionary::withCapacity(2);
++	OSDictionary *b = a50_range(A50_BRIGHTNESS_MAX, (unsigned)((uint64_t)A50_BRIGHTNESS_MAX * permille / 1000));
++	OSDictionary *mn = a50_range(A50_NITS_MAX * 1000, A50_NITS_MAX * permille);
++	if (params && b && mn) {
++		params->setObject("brightness", b);
++		params->setObject("BrightnessMilliNits", mn);
++		setProperty("IODisplayParameters", params);
++	}
++	OSSafeReleaseNULL(params);
++	OSSafeReleaseNULL(b);
++	OSSafeReleaseNULL(mn);
++}
++
++bool
++AppleARMBacklight::start(IOService *provider)
++{
++	if (!IOService::start(provider)) {
++		return false;
++	}
++	unsigned copied = 0;
++	IORegistryEntry *dt = IORegistryEntry::fromPath("/backlight", gIODTPlane);
++	OSDictionary *props = dt != NULL ? dt->dictionaryWithProperties() : NULL;
++	OSCollectionIterator *it = props != NULL ? OSCollectionIterator::withCollection(props) : NULL;
++	if (it != NULL) {
++		const OSSymbol *key;
++		while ((key = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++			const char *k = key->getCStringNoCopy();
++			if (strcmp(k, "name") == 0 || strcmp(k, "compatible") == 0 || strcmp(k, "device_type") == 0 ||
++			    strncmp(k, "AAPL,", 5) == 0 || strncmp(k, "function-", 9) == 0) {
++				continue;
++			}
++			setProperty(key, props->getObject(key));
++			copied++;
++		}
++	}
++	OSSafeReleaseNULL(it);
++	OSSafeReleaseNULL(props);
++	OSSafeReleaseNULL(dt);
++	setProperty("backlight-control", kOSBooleanTrue);
++	publish(A50_BOOT_PERMILLE);
++	a50_backlight = this;
++	a50_panel_set_permille(A50_BOOT_PERMILLE, "boot");
++	registerService();
++	IOLog("A50 BACKLIGHT: AppleARMBacklight up, %u properties of the device tree's /backlight\n", copied);
++	return true;
++}
++
++IOReturn
++AppleARMBacklight::setProperties(OSObject *properties)
++{
++	return a50_backlight_properties(properties, "AppleARMBacklight");
++}
++
++/* A number, or a {min, max, value} range's value, or 4/8 bytes of data. */
++static bool
++a50_number(OSObject *o, uint64_t *v)
++{
++	if (OSNumber *n = OSDynamicCast(OSNumber, o)) {
++		*v = n->unsigned64BitValue();
++		return true;
++	}
++	if (OSDictionary *d = OSDynamicCast(OSDictionary, o)) {
++		return a50_number(d->getObject("value"), v);
++	}
++	if (OSData *data = OSDynamicCast(OSData, o)) {
++		if (data->getLength() == 4) {
++			*v = *(const uint32_t *)data->getBytesNoCopy();
++			return true;
++		}
++		if (data->getLength() == 8) {
++			*v = *(const uint64_t *)data->getBytesNoCopy();
++			return true;
++		}
++	}
++	return false;
++}
++
++static void
++a50_log_object(const char *who, const char *key, OSObject *o, int depth)
++{
++	uint64_t v;
++	if (a50_bl_lines >= 300) {
++		return;
++	}
++	if (OSDictionary *d = OSDynamicCast(OSDictionary, o)) {
++		if (depth < 2) {
++			OSCollectionIterator *it = OSCollectionIterator::withCollection(d);
++			const OSSymbol *k;
++			while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++				char path[96];
++				snprintf(path, sizeof(path), "%s.%s", key, k->getCStringNoCopy());
++				a50_log_object(who, path, d->getObject(k), depth + 1);
++			}
++			OSSafeReleaseNULL(it);
++			return;
++		}
++	}
++	a50_bl_lines++;
++	if (a50_number(o, &v)) {
++		IOLog("A50 BACKLIGHT: %s set %s = %llu (%#llx)\n", who, key, v, v);
++	} else if (OSBoolean *b = OSDynamicCast(OSBoolean, o)) {
++		IOLog("A50 BACKLIGHT: %s set %s = %s\n", who, key, b->isTrue() ? "true" : "false");
++	} else {
++		IOLog("A50 BACKLIGHT: %s set %s (%s)\n", who, key, o != NULL ? o->getMetaClass()->getClassName() : "null");
++	}
++}
++
++/* AppleARMBacklight's and AppleCLCD's setProperties (SweetFramebuffer.cpp). */
++IOReturn
++a50_backlight_properties(OSObject *properties, const char *who)
++{
++	OSDictionary *dict = OSDynamicCast(OSDictionary, properties);
++	if (dict == NULL) {
++		return kIOReturnBadArgument;
++	}
++	OSCollectionIterator *it = OSCollectionIterator::withCollection(dict);
++	const OSSymbol *k;
++	while (it != NULL && (k = OSDynamicCast(OSSymbol, it->getNextObject())) != NULL) {
++		a50_log_object(who, k->getCStringNoCopy(), dict->getObject(k), 0);
++	}
++	OSSafeReleaseNULL(it);
++
++	OSDictionary *params = OSDynamicCast(OSDictionary, dict->getObject("IODisplayParameters"));
++	OSDictionary *src = params != NULL ? params : dict;
++	uint64_t v;
++	unsigned permille = ~0u;
++	const char *why = NULL;
++	uint64_t p = ~0ULL;
++	if (a50_number(src->getObject("BrightnessMilliNits"), &v)) {
++		p = v / A50_NITS_MAX;
++		why = "BrightnessMilliNits";
++	} else if (a50_number(src->getObject("brightness"), &v)) {
++		p = v * 1000 / A50_BRIGHTNESS_MAX;
++		why = "brightness";
++	} else if (a50_number(dict->getObject("IOMFBBrightnessLevel"), &v)) {
++		p = ((v * 1000) >> 16) / A50_NITS_MAX;
++		why = "IOMFBBrightnessLevel";
++	}
++	if (p != ~0ULL) {
++		permille = p > 1000 ? 1000u : (unsigned)p;
++	}
++	if (permille != ~0u) {
++		a50_panel_set_permille(permille, why);
++		if (a50_backlight != NULL) {
++			a50_backlight->publish(permille);
++		}
++	}
++	return kIOReturnSuccess;
++}
++#endif /* ARM64_BOARD_CONFIG_A50 */
+diff --git a/iokit/Kernel/arm/SweetBattery.cpp b/iokit/Kernel/arm/SweetBattery.cpp
+index b7f6353..c5b434f 100644
+--- a/iokit/Kernel/arm/SweetBattery.cpp
++++ b/iokit/Kernel/arm/SweetBattery.cpp
+@@ -19,6 +19,7 @@ extern "C" int herolte_fg_read(unsigned *percent, unsigned *mv, int *ma,
+     unsigned *rem_mah, unsigned *full_mah);
+ #if defined(ARM64_BOARD_CONFIG_A50)
+ extern "C" int a50_charger_read(int *vbus, int *charging, int *full);
++extern "C" void a50_torch_vbus_changed(int vbus);       /* bsd/dev/a50_torch.c */
+ #define BATTERY_DESIGN_MAH 4000u        /* SM-A505FN EB-BA505ABU */
+ #define BATTERY_GAUGE_NAME "SM5713 fuel gauge"
+ #else
+@@ -331,6 +332,9 @@ SweetBattery::timerFired(OSObject *owner, IOTimerEventSource *sender)
+ 		if (++self->fTicks >= 15 || (state >= 0 && state != self->fChargerState)) {
+ 			if (state >= 0 && state != self->fChargerState) {
+ 				IOLog("SWEET BATTERY: charger now vbus=%d charging=%d done=%d\n", vbus, charging, done);
++				if (self->fChargerState < 0 || ((state ^ self->fChargerState) & 1)) {
++					a50_torch_vbus_changed(vbus);
++				}
+ 			}
+ 			self->fTicks = 0;
+ 			self->poll();
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 10354e9..97b369a 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -173,6 +173,9 @@ public:
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
++#if defined(ARM64_BOARD_CONFIG_A50)
++	IOReturn setProperties(OSObject *properties) APPLE_KEXT_OVERRIDE;
++#endif
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+@@ -209,6 +212,17 @@ public:
+ 
+ OSDefineMetaClassAndStructors(IOMobileFramebufferUserClient, IOUserClient);
+ 
++#if defined(ARM64_BOARD_CONFIG_A50)
++/* CoreBrightness sets IOMFBBrightnessLevel here (iokit/Kernel/arm/A50Backlight.cpp). */
++IOReturn a50_backlight_properties(OSObject *properties, const char *who);
++
++IOReturn
++AppleCLCD::setProperties(OSObject *properties)
++{
++	return a50_backlight_properties(properties, "AppleCLCD");
++}
++#endif
++
+ bool
+ AppleCLCD::start(IOService *provider)
+ {
+@@ -1255,6 +1269,23 @@ IOMobileFramebufferUserClient::externalMethod(uint32_t selector, IOExternalMetho
+ 	if (args->structureOutputDescriptor == NULL && args->structureOutput != NULL) {
+ 		bzero(args->structureOutput, args->structureOutputSize);
+ 	}
++#if defined(ARM64_BOARD_CONFIG_A50)
++	/* 50 SetBrightnessCorrection, 66/67 SPLC{Set,Get}Brightness, 68 SetParameter: their values, to find iOS's brightness. */
++	if (selector == 50 || selector == 66 || selector == 67 || selector == 68) {
++		static unsigned a50_sel_lines;
++		if (a50_sel_lines++ < 300) {
++			uint64_t s0 = args->scalarInputCount > 0 ? args->scalarInput[0] : 0;
++			uint64_t s1 = args->scalarInputCount > 1 ? args->scalarInput[1] : 0, st = 0;
++			if (args->structureInput != NULL && args->structureInputSize > 0) {
++				memcpy(&st, args->structureInput, args->structureInputSize < 8 ? args->structureInputSize : 8);
++			}
++			char who[32];
++			proc_selfname(who, sizeof(who));
++			IOLog("A50 FB: %s sel %u scalars %#llx %#llx struct(%u) %#llx\n", who, selector, s0, s1,
++			    args->structureInputSize, st);
++		}
++	}
++#endif
+ 	if (selector >= 64 || !(sweet_fb_logged & (1ULL << selector))) {
+ 		if (selector < 64) {
+ 			sweet_fb_logged |= 1ULL << selector;
+diff --git a/iokit/KernelConfigTables.cpp b/iokit/KernelConfigTables.cpp
+index ba79764..ff464a5 100644
+--- a/iokit/KernelConfigTables.cpp
++++ b/iokit/KernelConfigTables.cpp
+@@ -97,6 +97,14 @@ const char * gIOKernelConfigTables =
+     "     'IOMatchCategory' = SweetBattery;"
+     "   },"
+ #endif
++#if defined(ARM64_BOARD_CONFIG_A50)
++/* A50: the panel's brightness for CoreBrightness (iokit/Kernel/arm/A50Backlight.cpp). */
++    "   {"
++    "     'IOClass'         = AppleARMBacklight;"
++    "     'IOProviderClass' = IOResources;"
++    "     'IOMatchCategory' = AppleARMBacklight;"
++    "   },"
++#endif
+ #if defined(ARM64_BOARD_CONFIG_HEROLTE) && !defined(ARM64_BOARD_CONFIG_A50)
+     "   {"
+     "     'IOClass'         = HeroGPU;"
+diff --git a/iokit/conf/files.arm64 b/iokit/conf/files.arm64
+index e72b03f..8ea279d 100644
+--- a/iokit/conf/files.arm64
++++ b/iokit/conf/files.arm64
+@@ -17,6 +17,7 @@ iokit/Kernel/arm/SweetSurface.cpp                                optional iokitc
+ iokit/Kernel/arm/SweetFramebuffer.cpp                            optional iokitcpp
+ iokit/Kernel/arm/A5XELTEGPU.cpp                                 optional iokitcpp
+ iokit/Kernel/arm/SweetBattery.cpp                                optional iokitcpp
++iokit/Kernel/arm/A50Backlight.cpp                                optional iokitcpp
+ iokit/Kernel/arm/HeroGPU.cpp                                     optional iokitcpp
+ iokit/Kernel/arm/SweetWLAN.cpp                                   optional iokitcpp
+ iokit/Kernel/arm/SweetNetworkStack.cpp                           optional iokitcpp

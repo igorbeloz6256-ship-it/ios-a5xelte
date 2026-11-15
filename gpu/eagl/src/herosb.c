@@ -1,15 +1,17 @@
 /*
  * libherosb.dylib, in SpringBoard (boot-arg herosb=1, bsd/dev/herolte_gl.c): PosterBoard has no poster providers on this
  * root, so the wallpaper windows stay black. The picture of the drop zone goes into them, and behind the home screen.
- * DROP_DIR wallpaper.off turns it off.
+ * DROP_DIR wallpaper.off turns it off. On the Galaxy A50 it also answers AVFlashlight with the kernel's torch (below).
  */
 #include <CoreFoundation/CoreFoundation.h>
 #include <dispatch/dispatch.h>
 #include <fcntl.h>
+#include <mach-o/loader.h>      /* before objc/runtime.h: objc_addLoadImageFunc's struct mach_header */
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
 #include <string.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 
 #define DROP_DIR "/private/var/herolte/"
@@ -251,9 +253,129 @@ report_ranges(void *unused)
    herodrm_log("herosb: %u frame rate ranges raised to 60 so far", ranges_raised);
 }
 
+/*
+ * The flashlight (Control Center, lock screen): AVFlashlight asks mediaserverd's camera stack, which this port does not
+ * have, so [AVFlashlight hasFlashlight] is NO and its button does nothing. In SpringBoard, where SBUIFlashlightController
+ * keeps the one AVFlashlight, it answers itself and gives the level to the kernel: sysctl kern.a50_torch = 0..100
+ * (bsd/dev/a50_torch.c, the Galaxy A50's rear LED). Only where that sysctl exists; DROP_DIR flashlight.off turns it off.
+ */
+static float torch_level;
+static bool torch_hooked;
+
+static BOOL
+fl_yes(id self, SEL cmd)
+{
+   return YES;
+}
+
+static BOOL
+fl_no(id self, SEL cmd)
+{
+   return NO;
+}
+
+/* No server connection to set up: NSObject's init is all there is. */
+static id
+fl_init(id self, SEL cmd)
+{
+   return self;
+}
+
+/* ...and NSObject's dealloc, as nothing of Apple's was set up to be torn down. */
+static void
+fl_dealloc(id self, SEL cmd)
+{
+   struct objc_super base = { self, objc_getClass("NSObject") };
+   ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&base, cmd);
+}
+
+static float
+fl_level(id self, SEL cmd)
+{
+   return torch_level;
+}
+
+static BOOL
+fl_set_level(id self, SEL cmd, float level, id *error)
+{
+   level = level < 0.0f ? 0.0f : (level > 1.0f ? 1.0f : level);
+   int value = (int)(level * 100.0f + 0.5f);
+   if (level > 0.0f && value == 0)
+      value = 1;
+   int r = sysctlbyname("kern.a50_torch", NULL, NULL, &value, sizeof(value));
+   id key = nsstring("flashlightLevel");
+   ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("willChangeValueForKey:"), key);
+   torch_level = level;
+   ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("didChangeValueForKey:"), key);
+   herodrm_log("herosb: flashlight level %.2f -> kern.a50_torch %d (%d)", level, value, r);
+   if (error)
+      *error = nil;
+   return r == 0;
+}
+
+static BOOL
+fl_power_on(id self, SEL cmd, id *error)
+{
+   if (error)
+      *error = nil;
+   return YES;
+}
+
+static void
+fl_power_off(id self, SEL cmd)
+{
+   if (torch_level > 0.0f)
+      fl_set_level(self, sel_registerName("setFlashlightLevel:withError:"), 0.0f, NULL);
+}
+
+static void
+hook(Class cls, const char *selector, IMP imp, bool class_method, unsigned *count)
+{
+   SEL sel = sel_registerName(selector);
+   Method m = class_method ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
+   if (m) {
+      method_setImplementation(m, imp);
+      (*count)++;
+   } else {
+      herodrm_log("herosb: flashlight: AVFlashlight has no %c%s", class_method ? '+' : '-', selector);
+   }
+}
+
+static void
+hook_flashlight(void)
+{
+   Class flashlight = objc_getClass("AVFlashlight");
+   if (torch_hooked || !flashlight)
+      return;
+   torch_hooked = true;
+   unsigned n = 0;
+   hook(flashlight, "hasFlashlight", (IMP)fl_yes, true, &n);
+   hook(flashlight, "init", (IMP)fl_init, false, &n);
+   hook(flashlight, "dealloc", (IMP)fl_dealloc, false, &n);
+   hook(flashlight, "isAvailable", (IMP)fl_yes, false, &n);
+   hook(flashlight, "isOverheated", (IMP)fl_no, false, &n);
+   hook(flashlight, "flashlightLevel", (IMP)fl_level, false, &n);
+   hook(flashlight, "setFlashlightLevel:withError:", (IMP)fl_set_level, false, &n);
+   hook(flashlight, "turnPowerOnWithError:", (IMP)fl_power_on, false, &n);
+   hook(flashlight, "turnPowerOff", (IMP)fl_power_off, false, &n);
+   herodrm_log("herosb: flashlight: %u AVFlashlight methods answered here", n);
+}
+
+/* AVFlashlight's framework may come in after this library: every image that loads is a chance. */
+static void
+look_for_flashlight(const struct mach_header *header)
+{
+   if (!torch_hooked)
+      hook_flashlight();
+}
+
 __attribute__((constructor)) static void
 herosb_start(void)
 {
+   int torch = 0;
+   size_t torch_size = sizeof(torch);
+   if (access(DROP_DIR "flashlight.off", F_OK) != 0 && sysctlbyname("kern.a50_torch", &torch, &torch_size, NULL, 0) == 0)
+      objc_addLoadImageFunc(look_for_flashlight);
    if (access(DROP_DIR "fps.off", F_OK) != 0) {
       raise_frame_rates();
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);
