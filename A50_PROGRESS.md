@@ -764,6 +764,12 @@
   AVFlashlight уже загружен у SpringBoard), `class_replaceMethod` только в
   AVFlashlight (и его метаклассе), init/dealloc идут в суперкласс; функция для
   objc_addLoadImageFunc только ставит попытку в main queue.
+- Коммит `ce15096`: mesa-ios 43744715669 — success, SHA256SUMS OK (9).
+  Пакет 1794766374 (новая `libherosb.dylib` 71072 байта, `libdrm`, обои,
+  `gestures.off`), блок 13711359, **verified**; BOOT остался xnu18, reboot
+  2026-11-15 21:12:55.
+- **На телефоне: обои вернулись, фонарик работает и от кабеля, и без него**
+  (пользователь). Яркость — как в xnu18. Лог этой загрузки не снимался.
 - **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
   (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
   ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)
