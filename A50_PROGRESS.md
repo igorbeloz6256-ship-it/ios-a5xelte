@@ -739,6 +739,31 @@
   `function-*`). `herosb.c`: в SpringBoard методы `AVFlashlight` отвечают сами
   и передают уровень в `kern.a50_torch` — только если этот sysctl есть;
   `flashlight.off` выключает.
+- Коммит `d2f95cc`: xnu 43732536281 и mesa-ios 43732536267 — success,
+  SHA256SUMS OK. `xnu18\boot.img` (ADT с `/backlight`), sha256
+  `e79f37d8…d2b7`, хост-прогон проходит. Пакет 1794760779 **verified**, xnu18
+  в BOOT, reboot 2026-11-15 19:39:47.
+- **xnu18 на телефоне: яркость работает** (пользователь: «яркость регулируется
+  нормально»). **Обоев нет, значка фонарика нет.** Лог `boot-xnu18.txt`:
+  `A50 PANEL: DSIM fifoctrl=0x5507 intsrc=0x1000000`, `brightness 60.0% ->
+  WRDISBV 615 (boot)`, `AppleARMBacklight up, 38 properties`. CoreBrightness
+  пишет в AppleARMBacklight `brightness` и `backlight-level` (одно и то же, из
+  65536: 0x8000 → 50 %, 0x8f19 → 55.8 %), `DisplayBrightness.{Nits,
+  NitsPhysical,Brightness}` = 0, `DisplayBrightnessSliderPosition`, `FadePeriod`,
+  `CompensationTweak.{cap,scaler}`, `brightness-nits(-cap)`. Один раз приходит
+  `IOMFBBrightnessLevel = 0` на AppleCLCD (кратко 0 % до следующего
+  `brightness`). Единицы, значит, — доля от 65536.
+- **Причина пропажи обоев:** `CRASH SpringBoard[27] sig 5 … sub 0x21a530f18`, затем
+  то же с pid 162; третий SpringBoard запущен без libherosb (лимит 2), ни одной
+  строки `HEROLTE USER`. `objc_addLoadImageFunc` вызывает функцию для уже
+  загруженных образов, держа runtimeLock, а `look_for_flashlight` внутри
+  вызывала objc_getClass/method_setImplementation — повторный захват
+  os_unfair_lock = SIGTRAP. Вторая ошибка: `method_setImplementation` по ответу
+  `class_getInstanceMethod` поменял бы унаследованные `-init`/`-dealloc` у всех
+  классов. Исправлено в herosb: перехват сразу в конструкторе (фреймворк
+  AVFlashlight уже загружен у SpringBoard), `class_replaceMethod` только в
+  AVFlashlight (и его метаклассе), init/dealloc идут в суперкласс; функция для
+  objc_addLoadImageFunc только ставит попытку в main queue.
 - **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
   (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
   ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)

@@ -10,6 +10,7 @@
 #include <objc/message.h>
 #include <objc/runtime.h>
 #include <stdbool.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/sysctl.h>
 #include <unistd.h>
@@ -261,6 +262,7 @@ report_ranges(void *unused)
  */
 static float torch_level;
 static bool torch_hooked;
+static Class flashlight_base;           /* AVFlashlight's superclass: init and dealloc go on to it */
 
 static BOOL
 fl_yes(id self, SEL cmd)
@@ -274,18 +276,19 @@ fl_no(id self, SEL cmd)
    return NO;
 }
 
-/* No server connection to set up: NSObject's init is all there is. */
+/* No server connection to set up: the superclass's init is all there is. */
 static id
 fl_init(id self, SEL cmd)
 {
-   return self;
+   struct objc_super base = { self, flashlight_base };
+   return ((id (*)(struct objc_super *, SEL))objc_msgSendSuper)(&base, cmd);
 }
 
-/* ...and NSObject's dealloc, as nothing of Apple's was set up to be torn down. */
+/* ...and its dealloc, as nothing of Apple's was set up to be torn down. */
 static void
 fl_dealloc(id self, SEL cmd)
 {
-   struct objc_super base = { self, objc_getClass("NSObject") };
+   struct objc_super base = { self, flashlight_base };
    ((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&base, cmd);
 }
 
@@ -328,17 +331,30 @@ fl_power_off(id self, SEL cmd)
       fl_set_level(self, sel_registerName("setFlashlightLevel:withError:"), 0.0f, NULL);
 }
 
+/* Whether cls itself (not a superclass) has the method. */
+static bool
+own_method(Class cls, SEL sel)
+{
+   unsigned n = 0;
+   Method *list = class_copyMethodList(cls, &n);
+   bool found = false;
+   for (unsigned i = 0; list && i < n && !found; i++)
+      found = method_getName(list[i]) == sel;
+   free(list);
+   return found;
+}
+
+/*
+ * class_replaceMethod puts the method into AVFlashlight itself (its metaclass for +), whether it had its own or inherited
+ * one. (xnu18: method_setImplementation on class_getInstanceMethod's answer would change an inherited -init or -dealloc
+ * for every class.)
+ */
 static void
-hook(Class cls, const char *selector, IMP imp, bool class_method, unsigned *count)
+hook(Class cls, const char *selector, IMP imp, const char *types, unsigned *own)
 {
    SEL sel = sel_registerName(selector);
-   Method m = class_method ? class_getClassMethod(cls, sel) : class_getInstanceMethod(cls, sel);
-   if (m) {
-      method_setImplementation(m, imp);
-      (*count)++;
-   } else {
-      herodrm_log("herosb: flashlight: AVFlashlight has no %c%s", class_method ? '+' : '-', selector);
-   }
+   *own = (*own << 1) | own_method(cls, sel);
+   class_replaceMethod(cls, sel, imp, types);
 }
 
 static void
@@ -348,25 +364,40 @@ hook_flashlight(void)
    if (torch_hooked || !flashlight)
       return;
    torch_hooked = true;
-   unsigned n = 0;
-   hook(flashlight, "hasFlashlight", (IMP)fl_yes, true, &n);
-   hook(flashlight, "init", (IMP)fl_init, false, &n);
-   hook(flashlight, "dealloc", (IMP)fl_dealloc, false, &n);
-   hook(flashlight, "isAvailable", (IMP)fl_yes, false, &n);
-   hook(flashlight, "isOverheated", (IMP)fl_no, false, &n);
-   hook(flashlight, "flashlightLevel", (IMP)fl_level, false, &n);
-   hook(flashlight, "setFlashlightLevel:withError:", (IMP)fl_set_level, false, &n);
-   hook(flashlight, "turnPowerOnWithError:", (IMP)fl_power_on, false, &n);
-   hook(flashlight, "turnPowerOff", (IMP)fl_power_off, false, &n);
-   herodrm_log("herosb: flashlight: %u AVFlashlight methods answered here", n);
+   flashlight_base = class_getSuperclass(flashlight);
+   unsigned own = 0;
+   hook(object_getClass((id)flashlight), "hasFlashlight", (IMP)fl_yes, "B16@0:8", &own);
+   hook(flashlight, "init", (IMP)fl_init, "@16@0:8", &own);
+   hook(flashlight, "dealloc", (IMP)fl_dealloc, "v16@0:8", &own);
+   hook(flashlight, "isAvailable", (IMP)fl_yes, "B16@0:8", &own);
+   hook(flashlight, "isOverheated", (IMP)fl_no, "B16@0:8", &own);
+   hook(flashlight, "flashlightLevel", (IMP)fl_level, "f16@0:8", &own);
+   hook(flashlight, "setFlashlightLevel:withError:", (IMP)fl_set_level, "B28@0:8f16^@20", &own);
+   hook(flashlight, "turnPowerOnWithError:", (IMP)fl_power_on, "B24@0:8^@16", &own);
+   hook(flashlight, "turnPowerOff", (IMP)fl_power_off, "v16@0:8", &own);
+   herodrm_log("herosb: flashlight: AVFlashlight (superclass %s) answered here; its own methods of the 9: %#x",
+      flashlight_base ? class_getName(flashlight_base) : "none", own);
 }
 
-/* AVFlashlight's framework may come in after this library: every image that loads is a chance. */
+static volatile int flashlight_pending;
+
+static void
+try_flashlight(void *unused)
+{
+   flashlight_pending = 0;
+   hook_flashlight();
+}
+
+/*
+ * A framework loaded later may bring AVFlashlight. objc calls this with its runtime lock held (for the images already
+ * there, inside objc_addLoadImageFunc): nothing of objc here -- xnu18's SpringBoard trapped (SIGTRAP, twice) doing that.
+ * The main queue looks instead.
+ */
 static void
 look_for_flashlight(const struct mach_header *header)
 {
-   if (!torch_hooked)
-      hook_flashlight();
+   if (!torch_hooked && __sync_bool_compare_and_swap(&flashlight_pending, 0, 1))
+      dispatch_async_f(dispatch_get_main_queue(), NULL, try_flashlight);
 }
 
 __attribute__((constructor)) static void
@@ -374,8 +405,11 @@ herosb_start(void)
 {
    int torch = 0;
    size_t torch_size = sizeof(torch);
-   if (access(DROP_DIR "flashlight.off", F_OK) != 0 && sysctlbyname("kern.a50_torch", &torch, &torch_size, NULL, 0) == 0)
-      objc_addLoadImageFunc(look_for_flashlight);
+   if (access(DROP_DIR "flashlight.off", F_OK) != 0 && sysctlbyname("kern.a50_torch", &torch, &torch_size, NULL, 0) == 0) {
+      hook_flashlight();        /* SpringBoard links AVFlashlight's framework: already here, as a rule */
+      if (!torch_hooked)
+         objc_addLoadImageFunc(look_for_flashlight);
+   }
    if (access(DROP_DIR "fps.off", F_OK) != 0) {
       raise_frame_rates();
       dispatch_after_f(dispatch_time(DISPATCH_TIME_NOW, 120 * NSEC_PER_SEC), dispatch_get_main_queue(), NULL, report_ranges);
