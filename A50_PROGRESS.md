@@ -816,6 +816,28 @@
   грузится только при «reset»-пробуждении (`calliope_sram.bin` → `dram` → `iva`).
   `/dev/mem` в TWRP нет: опыты с регистрами ABOX — только из нашего ядра.
   У `7-0034` (tfa98xx) есть отладочные `reg`/`rw` в sysfs.
+- **Регистры ABOX** (`sound/soc/samsung/abox/abox.h`, SFR `0x14A50000`–`0x14A5FFFF`):
+  IP_INDEX 0x0, VERSION 0x4, SYSPOWER_CTRL 0x10, SYSTEM_CONFIG0 0x20, ROUTE_CTRL0–2
+  0x40–0x48 (UAIF_SPK(x) по 4 бита, SPUSM 19:16, DSIF 23:20), SPUS_CTRL0–3
+  0x200–0x20C, SIFS_CNT 0x280/0x284; UAIF(x) = 0x500 + 0x10·x: CTRL0 (SPK_ENABLE
+  0, MIC_ENABLE 1, MODE 2, IRQ_MODE 3, DATA_MODE 4, START_FIFO_DIFF 27:24/31:28),
+  CTRL1 (VALID_END 5:0, VALID_STR 11:6, SBIT_MAX 17:12, SLOT_MAX 20:18, WS_POLAR
+  21, WS_MODE 22, BCLK_POLARITY 23, FORMAT 28:24), STATUS +0xC; RDMA(x) = 0x1000
+  + 0x100·x: CTRL0 (ENABLE 0, PROGRESS 31), CTRL1, BUF_STR 0x08, BUF_END 0x0C,
+  BUF_OFFSET 0x10, STR_POINT 0x14, VOL_FACTOR 0x18, VOL_CHANGE 0x1C, SBACK_LIMIT
+  0x20, STATUS 0x30.
+- **Что ещё нужно для звука без Linux:** аудио-PLL (в TWRP «pll clock:
+  1179648040» при игре, 26 МГц после) и делители CMU для UAIF; SysMMU ABOX
+  (адреса буферов RDMA — это IOVA); сам ABOX может требовать прошивку calliope
+  для запуска DMA (у Linux старт RDMA идёт через IPC); TFA9872 на I2C-7 — это
+  HSI2C/USI (`11d10000.hsi2c`), другой контроллер, чем у тача и батареи, плюс
+  его настройка из `Tfa9872.cnt`; затем синк `/dev/hakios-audio` и установка
+  `HakiosAudio.driver` в mediaserverd.
+- **План:** (1) раунд только чтения: ядро логирует CMU/PLL, питание и SysMMU
+  ABOX, регистры ABOX (только если тактирование включено), ID TFA9872 по
+  HSI2C; (2) попытка звука без прошивки: PLL, UAIF2 мастером 48 кГц/16 бит,
+  RDMA7 с тоном, TFA9872 без DSP на малой громкости; (3) если DMA без прошивки
+  не идёт — загрузка calliope и IPC, как у Linux; (4) синк и модуль для iOS.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
