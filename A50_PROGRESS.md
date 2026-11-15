@@ -795,6 +795,23 @@
   `Exynos9610-Audio`; динамик через усилитель `tfa98xx` (I2C-7, 0x34, ему нужна
   своя конфигурация), кодек `rt5665` (I2C-6, 0x1b). Это несравнимо больше, чем
   I2S на S7.
+- **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
+  `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
+  оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
+  playbackCompletionType:]`, `-[TLAlert stop]`, `-[TLAlert stopWithOptions:]`;
+  UIKit — `-[UIFeedbackGenerator _playFeedback:withMinimumIntervalPassed:since:
+  prefersRegularPace:]`, `-[_UIFeedback play]`; на сервере — `AVHapticServerInstance`,
+  `AVHapticPlayer`, `CHHapticEngine`.
+- **0411 (вибромотор):** `bsd/dev/a50_vibrator.c` — sysctl `kern.a50_vibrate` =
+  N мс (до 10000, `max_timeout`), 0 — стоп; новый запрос заменяет старый,
+  выключение — thread_call с поколением (старое выключение не гасит новое).
+- **herovibe** (в `libherosb`, SpringBoard): `herovibe_tramp.S` — один вход
+  для всех наблюдаемых методов. Он сохраняет x0–x8 и q0–q7, вызывает
+  `herovibe_note(self, _cmd, arg2, arg3)` и прыгает в собственную реализацию
+  Apple, поэтому сигнатуры знать не нужно. Узор `VibePattern` (вкл/выкл, мс…)
+  играется очередью по 20 мс, стоп по методам остановки; тактильный отклик
+  UIKit — 25 мс, не чаще раза в 60 мс. Логируются типы методов и первые
+  вызовы. Только если есть `kern.a50_vibrate`; `vibration.off` выключает.
 - **Bluetooth: не делаем.** Wi-Fi и BT у A50 — встроенный блок Samsung WLBT
   (`scsc_wifibt@119c0000`: mailbox AP↔WLBT, BAAW, remap; BT-звук идёт через
   ABOX, «scsc bt»). Он работает только с закрытой прошивкой Samsung (Maxwell)

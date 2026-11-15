@@ -1,0 +1,124 @@
+diff --git a/bsd/conf/files b/bsd/conf/files
+index 6b1b7f8..8fd8fe9 100644
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -122,6 +122,7 @@ bsd/dev/a50_touch.c			standard
+ bsd/dev/a50_battery.c			standard
+ bsd/dev/a50_torch.c			standard
+ bsd/dev/a50_panel.c			standard
++bsd/dev/a50_vibrator.c			standard
+ bsd/dev/sweet_sample.c			standard
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
+diff --git a/bsd/dev/a50_vibrator.c b/bsd/dev/a50_vibrator.c
+new file mode 100644
+index 0000000..fc3b2a8
+--- /dev/null
++++ b/bsd/dev/a50_vibrator.c
+@@ -0,0 +1,106 @@
++/*
++ * Galaxy A50 (SM-A505FN) vibration motor: Samsung's sec_vib, a motor whose
++ * supply is switched by one pin. sysctl kern.a50_vibrate = N runs it for N ms
++ * (1..10000, sec_vib,max_timeout), 0 stops it; a new value replaces the old
++ * one. Any user may set it: the iOS side (libherosb/libheroapp, which turn
++ * iOS's vibrations into it) runs as mobile.
++ *
++ * From the phone (TWRP, 2026-11-15): live DT /sec_vib/sec_vib_pdata
++ * sec_vib,ldo_en = <&gpa2 1 0>, ldo_type 1, max_timeout 10000; with
++ * "echo 500 > /sys/class/timed_output/vibrator/enable" gpa2-1 reads CON 0x1
++ * DAT 1, and DAT 0 afterwards. gpa2: ALIVE pinctrl 0x11850000 + 0x060.
++ * Writes: gpa2-1's CON field and DAT bit only.
++ */
++#if defined(ARM64_BOARD_CONFIG_A50)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/kernel.h>
++#include <sys/sysctl.h>
++#include <kern/clock.h>
++#include <kern/locks.h>
++#include <kern/thread_call.h>
++#include <machine/machine_routines.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++
++#define A50_ALIVE_PINCTRL_PA    0x11850000u
++#define A50_GPA2                0x060u
++#define VIB_PIN                 1u
++#define PIN_CON                 0x00u
++#define PIN_DAT                 0x04u
++#define VIB_MAX_MS              10000
++
++static LCK_GRP_DECLARE(a50_vib_grp, "a50_vib");
++static LCK_MTX_DECLARE(a50_vib_lock, &a50_vib_grp);
++static vm_offset_t vb_alive;
++static thread_call_t vb_off_call;
++static int a50_vibrate_ms;
++static unsigned vb_lines;
++
++static void
++vb_motor(bool on)
++{
++	__asm__ volatile ("dmb oshst" ::: "memory");
++	uint32_t dat = *(volatile uint32_t *)(vb_alive + A50_GPA2 + PIN_DAT);
++	*(volatile uint32_t *)(vb_alive + A50_GPA2 + PIN_DAT) = on ? (dat | (1u << VIB_PIN)) : (dat & ~(1u << VIB_PIN));
++	uint32_t con = *(volatile uint32_t *)(vb_alive + A50_GPA2 + PIN_CON);
++	*(volatile uint32_t *)(vb_alive + A50_GPA2 + PIN_CON) = (con & ~(0xfu << (4 * VIB_PIN))) | (1u << (4 * VIB_PIN));
++}
++
++static uintptr_t vb_generation;        /* each request's; a stop already on its way for an older one does nothing */
++
++static void
++vb_off(__unused thread_call_param_t p0, thread_call_param_t generation)
++{
++	lck_mtx_lock(&a50_vib_lock);
++	if (vb_alive != 0 && (uintptr_t)generation == vb_generation) {
++		vb_motor(false);
++		a50_vibrate_ms = 0;
++	}
++	lck_mtx_unlock(&a50_vib_lock);
++}
++
++static void
++a50_vibrate(int ms)
++{
++	lck_mtx_lock(&a50_vib_lock);
++	if (vb_alive == 0) {
++		vb_alive = ml_io_map(A50_ALIVE_PINCTRL_PA, 0x1000);
++		vb_off_call = thread_call_allocate(vb_off, NULL);
++	}
++	if (vb_alive == 0 || vb_off_call == NULL) {
++		lck_mtx_unlock(&a50_vib_lock);
++		return;
++	}
++	thread_call_cancel(vb_off_call);
++	vb_generation++;
++	ms = ms < 0 ? 0 : (ms > VIB_MAX_MS ? VIB_MAX_MS : ms);
++	vb_motor(ms > 0);
++	if (ms > 0) {
++		uint64_t deadline;
++		clock_interval_to_deadline((uint32_t)ms, NSEC_PER_MSEC, &deadline);
++		thread_call_enter1_delayed(vb_off_call, (thread_call_param_t)vb_generation, deadline);
++	}
++	a50_vibrate_ms = ms;
++	if (vb_lines++ < 60) {
++		printf("A50 VIBRATOR: %d ms\n", ms);
++	}
++	lck_mtx_unlock(&a50_vib_lock);
++}
++
++static int
++sysctl_a50_vibrate SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int ms = a50_vibrate_ms, changed = 0;
++	int error = sysctl_io_number(req, ms, sizeof(ms), &ms, &changed);
++	if (error || !changed) {
++		return error;
++	}
++	a50_vibrate(ms);
++	return 0;
++}
++
++SYSCTL_PROC(_kern, OID_AUTO, a50_vibrate, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED,
++    0, 0, sysctl_a50_vibrate, "I", "Galaxy A50 vibration motor: on for N ms, 0 off");
++#endif /* ARM64_BOARD_CONFIG_A50 */
