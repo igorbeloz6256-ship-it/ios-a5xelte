@@ -795,6 +795,27 @@
   `Exynos9610-Audio`; динамик через усилитель `tfa98xx` (I2C-7, 0x34, ему нужна
   своя конфигурация), кодек `rt5665` (I2C-6, 0x1b). Это несравнимо больше, чем
   I2S на S7.
+- **Звук, vendor** (TWRP, `mount -o ro …/vendor`; файлы скопированы локально в
+  `E:\iOS-A50\flash\audio\vendor`, в git их нет): `firmware/calliope_sram.bin`
+  (32540), `calliope_dram.bin` (2061736), `calliope_iva.bin` (57728) — прошивка
+  ABOX; усилитель **TFA9872**: `firmware/Tfa9872.cnt` (7645), `tfadsp.bin`
+  (76972 — защита динамика, она работает на ABOX); `etc/mixer_paths.xml`.
+  `media-speaker` = `dev-speaker` + `erap-amp-reference` (DSM On) +
+  `route-sifs0-to-uaif0` + обратная связь `uaif2→nsrc3→wdma4`, `uaif4→nsrc2→wdma3`
+  + **`route-rdma7-to-sifs1` (SPUS OUT7 = SIFS1, SIFS1 = SPUS OUT7) +
+  `route-sifs1-to-uaif2` (UAIF2 SPK = SIFS1)**. Значит, усилитель на UAIF2 и
+  получает RDMA7 (у Android — поток после DSP).
+- **TWRP как стенд:** `tools/a50-alsa/a50alsa.c` — свой ALSA-инструмент
+  (статический arm64 без libc, сборка Arm GNU `aarch64-none-elf`; list/get/set/
+  tone). В TWRP 348 контролов; TFA-контролов нет. `firmware_class.path` =
+  `/vendor/firmware`, но TWRP подключает vendor уже после загрузки драйверов.
+  Маршрут RDMA7→SIFS1→UAIF2 ставится, но `hw_params` = -22:
+  `tfa98xx: invalid sample rate 48000` (контейнер не загружен, нет профилей) и
+  `samsung-abox: Invalid calliope state: 0` (прошивка ABOX не запущена; ABOX
+  остаётся runtime-active и не перезапускается). У `abox_enable()` прошивка
+  грузится только при «reset»-пробуждении (`calliope_sram.bin` → `dram` → `iva`).
+  `/dev/mem` в TWRP нет: опыты с регистрами ABOX — только из нашего ядра.
+  У `7-0034` (tfa98xx) есть отладочные `reg`/`rw` в sysfs.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
