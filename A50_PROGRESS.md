@@ -838,6 +838,27 @@
   HSI2C; (2) попытка звука без прошивки: PLL, UAIF2 мастером 48 кГц/16 бит,
   RDMA7 с тоном, TFA9872 без DSP на малой громкости; (3) если DMA без прошивки
   не идёт — загрузка calliope и IPC, как у Linux; (4) синк и модуль для iOS.
+- **Адреса для звука** (cmucal-sfr.c 9610, DTS, живой DT): CMU_TOP `0x12100000`
+  (CLKCMU_DISPAUD_AUD: mux 0x1030, div 0x1838, gate 0x2038); **CMU_DISPAUD
+  `0x14980000`**: PLL_AUD CON0 0x160 (ENABLE 31, STABLE 29, M 25:16, P 13:8, S
+  2:0), CON3 0x16c (K), locktime 0x0; MUX_AUD_UAIF2 0x1018, DIV AUDIF 0x1800,
+  CPU 0x180c, CPU_ACLK 0x1810, UAIF2 0x182c; гейты ABOX ACLK 0x2020, BCLK_UAIF2
+  0x2008, UAIF2 rstnsync 0x2018, CCLK_CA7 0x2030, SMMU_ABOX 0x20b0 (CG_VAL 21,
+  MANUAL 20); QCH ABOX S_ACLK 0x3014, S_BCLK2 0x3020, SMMU_ABOX 0x3060. **SysMMU
+  ABOX `0x14920000`** (port-name «ABox»; DPU — `0x14820000`). Тактирование ABOX
+  в DTS: PLL_OUT_AUD, GATE_ABOX_QCH_CPU, DOUT_CLK_AUD_AUDIF, DOUT_CLK_AUD_ACLK;
+  UAIF2: DOUT_CLK_AUD_UAIF2 + GATE_ABOX_QCH_S_BCLK2; sysreg ABOX `0x14810000`,
+  SRAM `0x14B00000`, GIC ABOX `0x14AF1000`.
+- **TFA9872:** I2C-7 = **hsi2c_3 `0x11D10000`** (USI_0_CMGP_I2C, USI v2:
+  USI_CON 0xC4 = 0), выводы gpm2-0 SCL / gpm3-0 SDA, функция 3 (pinctrl CMGP
+  `0x11C20000`); CMU_CMGP `0x11C00000`: MUX_CMGP_I2C 0x1004 (RCO или шина
+  CMGP), DIV 0x1804, гейты 0x2018/0x201c/0x2044, QCH 0x3014. TWRP: `i2cget -f
+  -y 7 0x34 0x03` = **0x3b** (старший байт ревизии, TFA9872 rev 0x3B72).
+- **0412 (раунд «только чтение»):** `bsd/dev/a50_audio.c`, по boot-arg
+  `a50audio=1` через 30 с после старта: CMU_TOP/DISPAUD/CMGP, PLL_AUD, гейты и
+  QCH; ABOX и SysMMU ABOX читаются только если их гейты не выключены вручную;
+  TFA9872 — ревизия и регистры 0x00–0x1F по hsi2c_3 (максимальный делитель).
+  Пишутся только поля выводов, контроллер HSI2C и адреса регистров TFA.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
