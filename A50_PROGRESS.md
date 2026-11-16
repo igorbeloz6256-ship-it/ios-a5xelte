@@ -886,6 +886,11 @@
   CLOCK_REQ (бит 1) в QCH: CLKCMU_DISPAUD_AUD (TOP 0x2038), ABOX ACLK (0x2020 /
   QCH 0x3014), SMMU_ABOX (0x20b0 / 0x3060), I2C_CMGP00 (CMGP 0x2018/0x201c/0x2044,
   QCH 0x3014). Шаги с записью журнала остаются.
+- Сборка `8fa42e5` (xnu 43827437829) упала: `a50_audio.c:237: call to
+  undeclared function 'au_step'` и `static declaration of 'au_step' follows
+  non-static declaration` (функция вызывалась в коде шины раньше, чем
+  объявлена; та же ошибка была и в 0413). **0415:** объявление `au_step`
+  заранее; цикл регистров TFA на `unsigned`.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
