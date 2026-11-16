@@ -1,0 +1,385 @@
+diff --git a/bsd/dev/a50_audio.c b/bsd/dev/a50_audio.c
+index 158c9ab..dabe66f 100644
+--- a/bsd/dev/a50_audio.c
++++ b/bsd/dev/a50_audio.c
+@@ -1,20 +1,20 @@
+ /*
+- * Galaxy A50 (SM-A505FN, Exynos 9610) sound, step 1: a look, nothing set. 30 s after boot (boot-arg a50audio=1) the
+- * kernel logs what the speaker path's hardware looks like as iOS finds it, for the next steps (A50_PROGRESS.md, "Звук"):
+- *  - CMU_TOP 0x12100000: CLKCMU_DISPAUD_AUD/CPU (mux 0x1030/0x1034, div 0x1838/0x183c, gate 0x2038/0x203c);
++ * Galaxy A50 (SM-A505FN, Exynos 9610) sound, step 1: a look. 30 s after boot (boot-arg a50audio=1) the kernel logs
++ * what the speaker path's hardware looks like as iOS finds it, for the next steps (A50_PROGRESS.md, "Звук"):
++ *  - CMU_TOP 0x12100000 (live DT clock-controller@0x12100000): CLKCMU_DISPAUD_AUD/CPU/DISP mux, div, gate;
+  *  - CMU_DISPAUD 0x14980000: PLL_AUD (CON0 0x160: ENABLE 31, STABLE 29, M 25:16, P 13:8, S 2:0; CON3 0x16c K),
+- *    muxes, dividers (AUDIF 0x1800, CPU 0x180c, CPU_ACLK 0x1810, UAIF2 0x182c), gates 0x2000-0x20bc, QCH 0x3000-0x3060
+- *    (drivers/soc/samsung/cal-if/exynos9610/cmucal-sfr.c);
+- *  - ABOX 0x14A50000 (sound/soc/samsung/abox/abox.h): system, routing, SPUS, UAIF0-4, timers, RDMA7, CPU PC; and the
+- *    ABOX SysMMU 0x14920000 (live DT: port-name "ABox") -- only when CMU_DISPAUD's ABOX ACLK (0x2020) and SMMU_ABOX
+- *    (0x20b0) gates are not held off by hand (MANUAL bit 20 with CG_VAL bit 21 clear): a block without its clock can
+- *    hang the bus;
++ *    muxes, dividers, gates and Q-channels of ABOX, UAIF2 and the ABOX SysMMU (cmucal-sfr.c of the 9610);
++ *  - ABOX 0x14A50000 (abox.h): system, routing, SPUS, UAIF2, timer 0, RDMA7, CPU PC; its SysMMU 0x14920000;
+  *  - the TFA9872 amplifier at 0x34 on hsi2c_3 (0x11D10000, USI_0_CMGP_I2C, pins gpm2-0 SCL / gpm3-0 SDA function 3 of
+- *    pinctrl 0x11C20000; CMU_CMGP 0x11C00000: MUX_CMGP_I2C 0x1004, DIV 0x1804, gates 0x2018/0x201c/0x2044, QCH
+- *    0x3014): its revision (register 0x03, big-endian; TWRP read 0x3b first) and the first registers. HSI2C as
+- *    drivers/i2c/busses/i2c-exynos5.c: USI_CON 0xC4 = 0 (USI reset off), fast-mode timing fields at the largest
+- *    divider (100 kHz or less whatever the input clock), auto mode.
+- * Writes: the two pins' CON/PUD fields, the HSI2C controller, and TFA9872 register addresses only.
++ *    pinctrl 0x11C20000; CMU_CMGP 0x11C00000): its revision (register 0x03, big-endian; TWRP read 0x3b first) and
++ *    the first registers. HSI2C as i2c-exynos5.c: USI_CON 0xC4 = 0, fast-mode timing at the largest divider, auto mode.
++ *
++ * xnu20 (two builds) hung the phone: the first with no line of this file in the log, the second right after
++ * "step CMU_TOP/CMU_DISPAUD next" -- it read whole CMU ranges, holes between Samsung's registers included. Now only
++ * registers cmucal-sfr.c and abox.h list are read, one at a time, and before each the log is written out
++ * (herolte_log_kick) and given 400 ms: if one hangs, the last line names it. Before ABOX and the SysMMU their clocks
++ * are asked for (gate held on by hand: MANUAL 20 + CG_VAL 21; Q-channel CLOCK_REQ, bit 1), each write logged the same.
++ * Writes: those gates and Q-channels, the two pins' CON/PUD fields, the HSI2C controller, TFA9872 register addresses.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A50)
+ #include <sys/param.h>
+@@ -26,6 +26,7 @@
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void herolte_log_kick(void);
+ void a50_audio_start(void);
+ 
+ #define CMU_TOP_PA              0x12100000u
+@@ -57,8 +58,63 @@ void a50_audio_start(void);
+ #define HSI2C_ADDR              0x70u
+ #define USI_CON                 0xc4u
+ 
++struct au_reg {
++	const char *name;
++	uint32_t off;
++};
++
++/* cmucal-sfr.c (exynos9610), block TOP. */
++static const struct au_reg au_top_regs[] = {
++	{ "TOP MUX_CLKCMU_DISPAUD_AUD", 0x1030 }, { "TOP DIV_CLKCMU_DISPAUD_AUD", 0x1838 },
++	{ "TOP GATE_CLKCMU_DISPAUD_AUD", 0x2038 }, { "TOP MUX_CLKCMU_DISPAUD_CPU", 0x1034 },
++	{ "TOP DIV_CLKCMU_DISPAUD_CPU", 0x183c }, { "TOP GATE_CLKCMU_DISPAUD_CPU", 0x203c },
++	{ "TOP MUX_CLKCMU_DISPAUD_DISP", 0x1038 }, { "TOP DIV_CLKCMU_DISPAUD_DISP", 0x1840 },
++	{ "TOP GATE_CLKCMU_DISPAUD_DISP", 0x2040 },
++};
++
++/* cmucal-sfr.c (exynos9610), block DISPAUD. */
++static const struct au_reg au_dispaud_regs[] = {
++	{ "PLL_CON0_PLL_AUD", 0x160 }, { "PLL_CON3_PLL_AUD", 0x16c }, { "PLL_LOCKTIME_PLL_AUD", 0x0 },
++	{ "PLL_CON0_MUX_CLKCMU_DISPAUD_AUD_USER", 0x100 }, { "PLL_CON2_MUX_CLKCMU_DISPAUD_AUD_USER", 0x108 },
++	{ "PLL_CON0_MUX_CLKCMU_DISPAUD_CPU_USER", 0x120 }, { "PLL_CON2_MUX_CLKCMU_DISPAUD_CPU_USER", 0x128 },
++	{ "PLL_CON0_MUX_CLKCMU_DISPAUD_DISP_USER", 0x140 }, { "PLL_CON2_MUX_CLKCMU_DISPAUD_DISP_USER", 0x148 },
++	{ "DISPAUD_CMU_DISPAUD_CONTROLLER_OPTION", 0x800 },
++	{ "MUX_CLK_AUD_CPU", 0x1004 }, { "MUX_CLK_AUD_CPU_HCH", 0x1008 }, { "MUX_CLK_AUD_UAIF2", 0x1018 },
++	{ "DIV_CLK_AUD_AUDIF", 0x1800 }, { "DIV_CLK_AUD_CPU", 0x180c }, { "DIV_CLK_AUD_CPU_ACLK", 0x1810 },
++	{ "DIV_CLK_AUD_CPU_PCLKDBG", 0x1814 }, { "DIV_CLK_AUD_UAIF2", 0x182c },
++	{ "GAT ABOX BCLK_UAIF2", 0x2008 }, { "GAT DISPAUD_CMU PCLK", 0x200c }, { "GAT RSTNSYNC AUD_UAIF2", 0x2018 },
++	{ "GAT ABOX ACLK", 0x2020 }, { "GAT ABOX CCLK_CA7", 0x2030 }, { "GAT SMMU_ABOX", 0x20b0 },
++	{ "DMYQCH ABOX_QCH_CPU", 0x3000 }, { "QCH ABOX_QCH_S_ACLK", 0x3014 }, { "QCH ABOX_QCH_S_BCLK2", 0x3020 },
++	{ "QCH SMMU_ABOX_QCH", 0x3060 },
++};
++
++/* abox.h. */
++static const struct au_reg au_abox_regs[] = {
++	{ "ABOX IP_INDEX", 0x0 }, { "ABOX VERSION", 0x4 }, { "ABOX SYSPOWER_CTRL", 0x10 }, { "ABOX SYSTEM_CONFIG0", 0x20 },
++	{ "ABOX ROUTE_CTRL0", 0x40 }, { "ABOX ROUTE_CTRL1", 0x44 }, { "ABOX ROUTE_CTRL2", 0x48 },
++	{ "ABOX SPUS_CTRL0", 0x200 }, { "ABOX SPUS_CTRL1", 0x204 }, { "ABOX SPUS_CTRL2", 0x208 }, { "ABOX SPUS_CTRL3", 0x20c },
++	{ "ABOX SPUS_CTRL_SIFS_CNT0", 0x280 }, { "ABOX SPUS_CTRL_SIFS_CNT1", 0x284 },
++	{ "ABOX UAIF2_CTRL0", 0x520 }, { "ABOX UAIF2_CTRL1", 0x524 }, { "ABOX UAIF2_STATUS", 0x52c },
++	{ "ABOX TIMER0_CTRL0", 0x600 }, { "ABOX TIMER0_CTRL1", 0x604 },
++	{ "ABOX RDMA7_CTRL0", 0x1700 }, { "ABOX RDMA7_CTRL1", 0x1704 }, { "ABOX RDMA7_BUF_STR", 0x1708 },
++	{ "ABOX RDMA7_BUF_END", 0x170c }, { "ABOX RDMA7_BUF_OFFSET", 0x1710 }, { "ABOX RDMA7_STR_POINT", 0x1714 },
++	{ "ABOX RDMA7_STATUS", 0x1730 }, { "ABOX CPU_PC", 0x2c3c }, { "ABOX CPU_L2C_STATUS", 0x2c40 },
++};
++
++static const struct au_reg au_smmu_regs[] = {
++	{ "SMMU_ABOX 0x0", 0x0 }, { "SMMU_ABOX 0x4", 0x4 }, { "SMMU_ABOX 0x8", 0x8 },
++};
++
++/* cmucal-sfr.c (exynos9610), block CMGP. */
++static const struct au_reg au_cmgp_regs[] = {
++	{ "CMGP MUX_CLK_CMGP_I2C", 0x1004 }, { "CMGP DIV_CLK_CMGP_I2C", 0x1804 },
++	{ "CMGP GOUT I2C_CMGP00 IPCLK", 0x2018 }, { "CMGP GOUT I2C_CMGP00 PCLK", 0x201c },
++	{ "CMGP GOUT RSTNSYNC CMGP_I2C", 0x2044 }, { "CMGP QCH I2C_CMGP00", 0x3014 },
++};
++
+ static vm_offset_t au_i2c;
+-static bool au_step(int bit, const char *what);         /* below: the log written out before each step */
++static int au_sleep_chan;
++static int au_mask;
+ 
+ static uint32_t
+ au_rd(vm_offset_t base, uint32_t off)
+@@ -76,43 +132,77 @@ au_wr(vm_offset_t base, uint32_t off, uint32_t v)
+ 	__asm__ volatile ("dsb osh" ::: "memory");
+ }
+ 
+-/* Registers [first, last] of base, four to a line. */
+ static void
+-au_dump(const char *what, vm_offset_t base, uint32_t first, uint32_t last)
++au_sleep_ms(unsigned ms)
+ {
+-	for (uint32_t off = first; off <= last; off += 16) {
+-		uint32_t v[4] = { 0, 0, 0, 0 };
+-		for (unsigned i = 0; i < 4 && off + 4 * i <= last; i++) {
+-			v[i] = au_rd(base, off + 4 * i);
+-		}
+-		printf("A50 AUDIO: %s +%#06x: %08x %08x %08x %08x\n", what, off, v[0], v[1], v[2], v[3]);
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&au_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/* The log written out now (herolte_ufs.c) and given time to reach the disk. */
++static void
++au_kick(unsigned ms)
++{
++	herolte_log_kick();
++	au_sleep_ms(ms);
++}
++
++/* One register, the log out just before it is read: if the read hangs, the last line names it. */
++static uint32_t
++au_read_logged(const char *what, vm_offset_t base, uint32_t off)
++{
++	printf("A50 AUDIO: read %s +%#x next\n", what, off);
++	au_kick(400);
++	uint32_t v = au_rd(base, off);
++	printf("A50 AUDIO: %s +%#x = %#x\n", what, off, v);
++	return v;
++}
++
++/* The same for a write, then what the register reads back. */
++static void
++au_write_logged(const char *what, vm_offset_t base, uint32_t off, uint32_t v)
++{
++	printf("A50 AUDIO: write %s +%#x = %#x next\n", what, off, v);
++	au_kick(400);
++	au_wr(base, off, v);
++	printf("A50 AUDIO: %s +%#x now %#x\n", what, off, au_rd(base, off));
++}
++
++static void
++au_read_table(vm_offset_t base, const struct au_reg *regs, unsigned n)
++{
++	for (unsigned i = 0; i < n; i++) {
++		(void)au_read_logged(regs[i].name, base, regs[i].off);
+ 	}
+ }
+ 
+-/* A CMU gate held off by hand: MANUAL (20) set, CG_VAL (21) clear. */
++/* A step of the mask (a50audio): announced, the log out first. */
+ static bool
+-au_gated_off(uint32_t gate)
++au_step(int bit, const char *what)
+ {
+-	return (gate & (1u << 20)) && !(gate & (1u << 21));
++	if (!(au_mask & bit)) {
++		printf("A50 AUDIO: step %s skipped (a50audio=%#x)\n", what, au_mask);
++		return false;
++	}
++	printf("A50 AUDIO: step %s next\n", what);
++	au_kick(1000);
++	return true;
+ }
+ 
+-/*
+- * xnu20 hung on its first look at the audio blocks: a block whose clock is gated (by the CMU on its own, not only by
+- * hand) does not answer the bus. Before a block is read its clocks are asked for: the CMU gate held on by hand (MANUAL
+- * 20 and CG_VAL 21, as cmucal does for an enabled gate) and the Q-channel's CLOCK_REQ (bit 1) set.
+- */
++/* A clock asked for: the CMU gate held on by hand (MANUAL 20 + CG_VAL 21), the Q-channel's CLOCK_REQ (bit 1) set. */
+ static void
+ au_clock_on(const char *what, vm_offset_t cmu, uint32_t gate, uint32_t qch)
+ {
+-	uint32_t g0 = gate ? au_rd(cmu, gate) : 0, q0 = qch ? au_rd(cmu, qch) : 0;
+ 	if (gate) {
+-		au_wr(cmu, gate, g0 | (1u << 20) | (1u << 21));
++		uint32_t g = au_read_logged(what, cmu, gate);
++		au_write_logged(what, cmu, gate, g | (1u << 20) | (1u << 21));
+ 	}
+ 	if (qch) {
+-		au_wr(cmu, qch, q0 | (1u << 1));
++		uint32_t q = au_read_logged(what, cmu, qch);
++		au_write_logged(what, cmu, qch, q | (1u << 1));
+ 	}
+-	printf("A50 AUDIO: clock %s on: gate %#x -> %#x, qch %#x -> %#x\n", what, g0, gate ? au_rd(cmu, gate) : 0, q0,
+-	    qch ? au_rd(cmu, qch) : 0);
+ }
+ 
+ static void
+@@ -220,32 +310,22 @@ au_probe_tfa(void)
+ 		printf("A50 AUDIO: CMGP mapping failed\n");
+ 		return;
+ 	}
+-	uint32_t ipclk = au_rd(cmgp, 0x2018), pclk = au_rd(cmgp, 0x201c), rst = au_rd(cmgp, 0x2044);
+-	printf("A50 AUDIO: CMU_CMGP mux_i2c=%#x div_i2c=%#x gates ipclk=%#x pclk=%#x rstnsync=%#x qch=%#x\n",
+-	    au_rd(cmgp, 0x1004), au_rd(cmgp, 0x1804), ipclk, pclk, rst, au_rd(cmgp, 0x3014));
+-	/* hsi2c_3's clocks asked for, as ABOX's (see au_clock_on). */
+-	au_clock_on("I2C_CMGP00 IPCLK", cmgp, 0x2018, 0x3014);
+-	au_clock_on("I2C_CMGP00 PCLK", cmgp, 0x201c, 0);
+-	au_clock_on("CMGP_I2C RSTNSYNC", cmgp, 0x2044, 0);
+-	ipclk = au_rd(cmgp, 0x2018);
+-	pclk = au_rd(cmgp, 0x201c);
+-	printf("A50 AUDIO: gpm2 con=%#x dat=%#x pud=%#x gpm3 con=%#x dat=%#x pud=%#x\n", au_rd(pins, GPM2),
+-	    au_rd(pins, GPM2 + 4), au_rd(pins, GPM2 + 8), au_rd(pins, GPM3), au_rd(pins, GPM3 + 4), au_rd(pins, GPM3 + 8));
+-	if (au_gated_off(ipclk) || au_gated_off(pclk)) {
+-		printf("A50 AUDIO: hsi2c_3's clocks are off: TFA9872 not asked\n");
+-		return;
+-	}
+-	if (!au_step(8, "hsi2c_3 registers")) {
+-		return;
+-	}
+-	printf("A50 AUDIO: hsi2c_3 as found: ctl=%#x conf=%#x fs1=%#x fs2=%#x fs3=%#x usi_con=%#x\n", au_rd(au_i2c,
+-	    HSI2C_CTL), au_rd(au_i2c, HSI2C_CONF), au_rd(au_i2c, HSI2C_FS1), au_rd(au_i2c, HSI2C_FS2), au_rd(au_i2c,
+-	    HSI2C_FS3), au_rd(au_i2c, USI_CON));
++	au_read_table(cmgp, au_cmgp_regs, (unsigned)(sizeof(au_cmgp_regs) / sizeof(au_cmgp_regs[0])));
++	au_clock_on("CMGP GOUT I2C_CMGP00 IPCLK", cmgp, 0x2018, 0x3014);
++	au_clock_on("CMGP GOUT I2C_CMGP00 PCLK", cmgp, 0x201c, 0);
++	au_clock_on("CMGP GOUT RSTNSYNC CMGP_I2C", cmgp, 0x2044, 0);
++	(void)au_read_logged("gpm2 CON", pins, GPM2);
++	(void)au_read_logged("gpm3 CON", pins, GPM3);
++	(void)au_read_logged("hsi2c_3 CTL", au_i2c, HSI2C_CTL);
++	(void)au_read_logged("hsi2c_3 CONF", au_i2c, HSI2C_CONF);
++	(void)au_read_logged("hsi2c_3 USI_CON", au_i2c, USI_CON);
+ 	/* hsi2c3_bus: gpm2-0 (SCL), gpm3-0 (SDA) function 3, no pull. */
+ 	au_set_field(pins, GPM2 + 8, 0, 0);
+ 	au_set_field(pins, GPM3 + 8, 0, 0);
+ 	au_set_field(pins, GPM2, 0, 3);
+ 	au_set_field(pins, GPM3, 0, 3);
++	printf("A50 AUDIO: hsi2c_3 set up next\n");
++	au_kick(400);
+ 	au_i2c_init();
+ 	uint16_t rev = 0;
+ 	if (!au_tfa_read(0x03, &rev)) {
+@@ -263,92 +343,38 @@ au_probe_tfa(void)
+ 	}
+ }
+ 
+-static int au_sleep_chan;
+-static int au_mask;
+-
+-static void
+-au_sleep_ms(unsigned ms)
+-{
+-	uint64_t deadline;
+-	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+-	(void)assert_wait_deadline(&au_sleep_chan, THREAD_UNINT, deadline);
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+-/*
+- * xnu20 hung the phone about 30 s after boot with no line of this file in the log: the 10 s log write never caught
+- * them. Before each step the log is written out now (herolte_ufs.c) and given 2 s, so the last line names the step
+- * that hangs, if one does.
+- */
+-extern void herolte_log_kick(void);
+-
+-static bool
+-au_step(int bit, const char *what)
+-{
+-	if (!(au_mask & bit)) {
+-		printf("A50 AUDIO: step %s skipped (a50audio=%#x)\n", what, au_mask);
+-		return false;
+-	}
+-	printf("A50 AUDIO: step %s next\n", what);
+-	herolte_log_kick();
+-	au_sleep_ms(2000);
+-	return true;
+-}
+-
+ static void
+ au_probe(__unused void *arg, __unused wait_result_t wr)
+ {
+ 	au_sleep_ms(30000);
+-	if (!au_step(1, "CMU_TOP/CMU_DISPAUD")) {
+-		return;
+-	}
+-	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000), dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
+-	if (!top || !dispaud) {
+-		printf("A50 AUDIO: CMU mapping failed\n");
+-		return;
+-	}
+-	uint32_t top_aud_gate = au_rd(top, 0x2038);
+-	printf("A50 AUDIO: CMU_TOP dispaud_aud mux=%#x div=%#x gate=%#x; dispaud_cpu mux=%#x div=%#x gate=%#x\n",
+-	    au_rd(top, 0x1030), au_rd(top, 0x1838), top_aud_gate, au_rd(top, 0x1034), au_rd(top, 0x183c), au_rd(top, 0x203c));
+-	uint32_t pll = au_rd(dispaud, 0x160);
+-	printf("A50 AUDIO: PLL_AUD con0=%#x (enable %u stable %u M %u P %u S %u) con3=%#x locktime=%#x\n", pll, pll >> 31,
+-	    (pll >> 29) & 1, (pll >> 16) & 0x3ff, (pll >> 8) & 0x3f, pll & 7, au_rd(dispaud, 0x16c), au_rd(dispaud, 0x0));
+-	au_dump("CMU_DISPAUD", dispaud, 0x100, 0x16c);
+-	au_dump("CMU_DISPAUD", dispaud, 0x800, 0x800);
+-	au_dump("CMU_DISPAUD", dispaud, 0x1000, 0x1030);
+-	au_dump("CMU_DISPAUD", dispaud, 0x1800, 0x1840);
+-	au_dump("CMU_DISPAUD", dispaud, 0x2000, 0x20bc);
+-	au_dump("CMU_DISPAUD", dispaud, 0x3000, 0x3060);
+-	/* CLKCMU_DISPAUD_AUD from CMU_TOP feeds the whole audio side; then ABOX's bus clock, its SysMMU's. */
+-	au_clock_on("CLKCMU_DISPAUD_AUD", top, 0x2038, 0);
+-	au_clock_on("ABOX ACLK", dispaud, 0x2020, 0x3014);
+-	au_clock_on("SMMU_ABOX", dispaud, 0x20b0, 0x3060);
+-	top_aud_gate = au_rd(top, 0x2038);
+-	uint32_t aclk = au_rd(dispaud, 0x2020), smmu = au_rd(dispaud, 0x20b0);
+-	if (au_gated_off(top_aud_gate) || au_gated_off(aclk)) {
+-		printf("A50 AUDIO: ABOX's clock is held off (top %#x aclk %#x): ABOX not read\n", top_aud_gate, aclk);
+-	} else if (au_step(2, "ABOX registers")) {
+-		vm_offset_t abox = ml_io_map(ABOX_PA, 0x4000);
+-		if (abox) {
+-			printf("A50 AUDIO: ABOX ip_index %#x version %#x\n", au_rd(abox, 0x0), au_rd(abox, 0x4));
+-			au_dump("ABOX", abox, 0x0, 0x4c);
+-			au_dump("ABOX", abox, 0x200, 0x20c);
+-			au_dump("ABOX", abox, 0x280, 0x28c);
+-			au_dump("ABOX", abox, 0x500, 0x56c);
+-			au_dump("ABOX", abox, 0x600, 0x61c);
+-			au_dump("ABOX", abox, 0x1700, 0x173c);
+-			au_dump("ABOX", abox, 0x2c3c, 0x2c4c);
++	if (au_step(1, "CMU_TOP/CMU_DISPAUD")) {
++		vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000), dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
++		if (!top || !dispaud) {
++			printf("A50 AUDIO: CMU mapping failed\n");
++			return;
+ 		}
+-	}
+-	if (au_gated_off(smmu)) {
+-		printf("A50 AUDIO: SMMU_ABOX's clock is held off (%#x): not read\n", smmu);
+-	} else if (au_step(4, "SMMU_ABOX registers")) {
+-		vm_offset_t mmu = ml_io_map(SMMU_ABOX_PA, 0x1000);
+-		if (mmu) {
+-			au_dump("SMMU_ABOX", mmu, 0x0, 0x7c);
++		au_read_table(top, au_top_regs, (unsigned)(sizeof(au_top_regs) / sizeof(au_top_regs[0])));
++		au_read_table(dispaud, au_dispaud_regs, (unsigned)(sizeof(au_dispaud_regs) / sizeof(au_dispaud_regs[0])));
++		if (au_step(2, "audio clocks on")) {
++			/* CLKCMU_DISPAUD_AUD from CMU_TOP feeds the audio side; then ABOX's bus clock and its SysMMU's. */
++			au_clock_on("TOP GATE_CLKCMU_DISPAUD_AUD", top, 0x2038, 0);
++			au_clock_on("ABOX ACLK", dispaud, 0x2020, 0x3014);
++			au_clock_on("SMMU_ABOX", dispaud, 0x20b0, 0x3060);
++		}
++		if (au_step(4, "ABOX registers")) {
++			vm_offset_t abox = ml_io_map(ABOX_PA, 0x4000);
++			if (abox) {
++				au_read_table(abox, au_abox_regs, (unsigned)(sizeof(au_abox_regs) / sizeof(au_abox_regs[0])));
++			}
++		}
++		if (au_step(8, "SMMU_ABOX registers")) {
++			vm_offset_t mmu = ml_io_map(SMMU_ABOX_PA, 0x1000);
++			if (mmu) {
++				au_read_table(mmu, au_smmu_regs, (unsigned)(sizeof(au_smmu_regs) / sizeof(au_smmu_regs[0])));
++			}
+ 		}
+ 	}
+-	if (au_step(8, "CMU_CMGP and hsi2c_3")) {
++	if (au_step(16, "CMU_CMGP, hsi2c_3, TFA9872")) {
+ 		au_probe_tfa();
+ 	}
+ 	printf("A50 AUDIO: look done\n");
+@@ -360,9 +386,9 @@ a50_audio_start(void)
+ {
+ 	int on = 0;
+ 	thread_t thread;
+-	/* a50audio=1: every step; otherwise a mask: 1 CMUs, 2 ABOX, 4 its SysMMU, 8 CMU_CMGP/hsi2c_3/TFA9872. */
++	/* a50audio=1: every step; otherwise a mask: 1 CMUs, 2 clocks on, 4 ABOX, 8 its SysMMU, 16 CMGP/hsi2c_3/TFA9872. */
+ 	PE_parse_boot_argn("a50audio", &on, sizeof(on));
+-	au_mask = on == 1 ? 0xf : on;
++	au_mask = on == 1 ? 0x1f : on;
+ 	if (on && kernel_thread_start(au_probe, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

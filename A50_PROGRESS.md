@@ -903,6 +903,15 @@
   0x1800–0x1840, 0x2000–0x20bc, 0x3000–0x3060 — Linux читает только описанные
   регистры) или запрет доступа к CMU со стороны uH (EL2). Паника при `debug=0xc`
   и `wdt=-1` тоже выглядит как зависание, и её текст в журнал не попадает.
+- Живой DT в TWRP: `clock-controller@0x12100000` (CMU_TOP, 0x8000) — адрес
+  верный; `/proc/iomem`: `/hsi2c@11D10000`, `/sysmmu@14920000`, ABOX `sfr`
+  `14a50000-14a5ffff`.
+- **0416 (продолжаем по шагам):** проба читает только регистры из
+  cmucal-sfr.c / abox.h, **по одному**. Перед каждым чтением и записью — строка
+  «read/write … next», запись журнала на диск и 400 мс. Шаги (маска
+  `a50audio`, 1 = все): 1 CMU_TOP/CMU_DISPAUD (9 + 28 регистров), 2 включить
+  тактирование (TOP 0x2038, ABOX ACLK 0x2020/QCH 0x3014, SMMU_ABOX 0x20b0/0x3060),
+  4 ABOX (27 регистров), 8 SysMMU ABOX (0x0/0x4/0x8), 16 CMGP + hsi2c_3 + TFA9872.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
