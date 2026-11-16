@@ -873,6 +873,19 @@
   ожидания. `a50audio=1` — все шаги, иначе маска: 1 CMU, 2 ABOX, 4 SysMMU ABOX,
   8 CMU_CMGP/hsi2c_3/TFA9872. Если зависнет снова, последняя строка покажет
   шаг.
+- Push `b896ea1` дошёл до GitHub (ветка a50), но сборка xnu не запустилась
+  (запусков с этим коммитом нет) — нужен ручной запуск (workflow_dispatch). По
+  просьбе пользователя в BOOT возвращён xnu19 (`aa483575…1032`, чтение обратно
+  совпало), reboot 2026-11-16 10:31:03.
+- **Вывод из исходников:** в `abox_rdma.c` все шаги воспроизведения
+  (`PCM_PLTDAI_OPEN`, `HW_PARAMS`, `PREPARE`, `TRIGGER`, `CLOSE`) — это IPC к
+  прошивке ABOX; процессор сам только читает `RDMA_CTRL0`/`STATUS`. Настоящий
+  звук на A50 требует запуска calliope и её протокола.
+- **0414 (переделанный xnu20 по просьбе пользователя):** до чтения блоков
+  проба сама включает их тактирование — гейт вручную (MANUAL 20 + CG_VAL 21) и
+  CLOCK_REQ (бит 1) в QCH: CLKCMU_DISPAUD_AUD (TOP 0x2038), ABOX ACLK (0x2020 /
+  QCH 0x3014), SMMU_ABOX (0x20b0 / 0x3060), I2C_CMGP00 (CMGP 0x2018/0x201c/0x2044,
+  QCH 0x3014). Шаги с записью журнала остаются.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:

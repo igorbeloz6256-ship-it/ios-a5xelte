@@ -1,0 +1,55 @@
+diff --git a/bsd/dev/a50_audio.c b/bsd/dev/a50_audio.c
+index 9c5c008..3de3f2c 100644
+--- a/bsd/dev/a50_audio.c
++++ b/bsd/dev/a50_audio.c
+@@ -95,6 +95,25 @@ au_gated_off(uint32_t gate)
+ 	return (gate & (1u << 20)) && !(gate & (1u << 21));
+ }
+ 
++/*
++ * xnu20 hung on its first look at the audio blocks: a block whose clock is gated (by the CMU on its own, not only by
++ * hand) does not answer the bus. Before a block is read its clocks are asked for: the CMU gate held on by hand (MANUAL
++ * 20 and CG_VAL 21, as cmucal does for an enabled gate) and the Q-channel's CLOCK_REQ (bit 1) set.
++ */
++static void
++au_clock_on(const char *what, vm_offset_t cmu, uint32_t gate, uint32_t qch)
++{
++	uint32_t g0 = gate ? au_rd(cmu, gate) : 0, q0 = qch ? au_rd(cmu, qch) : 0;
++	if (gate) {
++		au_wr(cmu, gate, g0 | (1u << 20) | (1u << 21));
++	}
++	if (qch) {
++		au_wr(cmu, qch, q0 | (1u << 1));
++	}
++	printf("A50 AUDIO: clock %s on: gate %#x -> %#x, qch %#x -> %#x\n", what, g0, gate ? au_rd(cmu, gate) : 0, q0,
++	    qch ? au_rd(cmu, qch) : 0);
++}
++
+ static void
+ au_set_field(vm_offset_t base, uint32_t reg, unsigned pin, uint32_t value)
+ {
+@@ -203,6 +222,12 @@ au_probe_tfa(void)
+ 	uint32_t ipclk = au_rd(cmgp, 0x2018), pclk = au_rd(cmgp, 0x201c), rst = au_rd(cmgp, 0x2044);
+ 	printf("A50 AUDIO: CMU_CMGP mux_i2c=%#x div_i2c=%#x gates ipclk=%#x pclk=%#x rstnsync=%#x qch=%#x\n",
+ 	    au_rd(cmgp, 0x1004), au_rd(cmgp, 0x1804), ipclk, pclk, rst, au_rd(cmgp, 0x3014));
++	/* hsi2c_3's clocks asked for, as ABOX's (see au_clock_on). */
++	au_clock_on("I2C_CMGP00 IPCLK", cmgp, 0x2018, 0x3014);
++	au_clock_on("I2C_CMGP00 PCLK", cmgp, 0x201c, 0);
++	au_clock_on("CMGP_I2C RSTNSYNC", cmgp, 0x2044, 0);
++	ipclk = au_rd(cmgp, 0x2018);
++	pclk = au_rd(cmgp, 0x201c);
+ 	printf("A50 AUDIO: gpm2 con=%#x dat=%#x pud=%#x gpm3 con=%#x dat=%#x pud=%#x\n", au_rd(pins, GPM2),
+ 	    au_rd(pins, GPM2 + 4), au_rd(pins, GPM2 + 8), au_rd(pins, GPM3), au_rd(pins, GPM3 + 4), au_rd(pins, GPM3 + 8));
+ 	if (au_gated_off(ipclk) || au_gated_off(pclk)) {
+@@ -293,6 +318,11 @@ au_probe(__unused void *arg, __unused wait_result_t wr)
+ 	au_dump("CMU_DISPAUD", dispaud, 0x1800, 0x1840);
+ 	au_dump("CMU_DISPAUD", dispaud, 0x2000, 0x20bc);
+ 	au_dump("CMU_DISPAUD", dispaud, 0x3000, 0x3060);
++	/* CLKCMU_DISPAUD_AUD from CMU_TOP feeds the whole audio side; then ABOX's bus clock, its SysMMU's. */
++	au_clock_on("CLKCMU_DISPAUD_AUD", top, 0x2038, 0);
++	au_clock_on("ABOX ACLK", dispaud, 0x2020, 0x3014);
++	au_clock_on("SMMU_ABOX", dispaud, 0x20b0, 0x3060);
++	top_aud_gate = au_rd(top, 0x2038);
+ 	uint32_t aclk = au_rd(dispaud, 0x2020), smmu = au_rd(dispaud, 0x20b0);
+ 	if (au_gated_off(top_aud_gate) || au_gated_off(aclk)) {
+ 		printf("A50 AUDIO: ABOX's clock is held off (top %#x aclk %#x): ABOX not read\n", top_aud_gate, aclk);
