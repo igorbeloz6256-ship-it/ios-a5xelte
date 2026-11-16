@@ -1,0 +1,119 @@
+diff --git a/bsd/dev/a50_audio.c b/bsd/dev/a50_audio.c
+index 8b36ebd..9c5c008 100644
+--- a/bsd/dev/a50_audio.c
++++ b/bsd/dev/a50_audio.c
+@@ -209,6 +209,9 @@ au_probe_tfa(void)
+ 		printf("A50 AUDIO: hsi2c_3's clocks are off: TFA9872 not asked\n");
+ 		return;
+ 	}
++	if (!au_step(8, "hsi2c_3 registers")) {
++		return;
++	}
+ 	printf("A50 AUDIO: hsi2c_3 as found: ctl=%#x conf=%#x fs1=%#x fs2=%#x fs3=%#x usi_con=%#x\n", au_rd(au_i2c,
+ 	    HSI2C_CTL), au_rd(au_i2c, HSI2C_CONF), au_rd(au_i2c, HSI2C_FS1), au_rd(au_i2c, HSI2C_FS2), au_rd(au_i2c,
+ 	    HSI2C_FS3), au_rd(au_i2c, USI_CON));
+@@ -235,14 +238,44 @@ au_probe_tfa(void)
+ }
+ 
+ static int au_sleep_chan;
++static int au_mask;
+ 
+ static void
+-au_probe(__unused void *arg, __unused wait_result_t wr)
++au_sleep_ms(unsigned ms)
+ {
+ 	uint64_t deadline;
+-	clock_interval_to_deadline(30, NSEC_PER_SEC, &deadline);
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
+ 	(void)assert_wait_deadline(&au_sleep_chan, THREAD_UNINT, deadline);
+ 	thread_block(THREAD_CONTINUE_NULL);
++}
++
++/*
++ * xnu20 hung the phone about 30 s after boot with no line of this file in the log: the 10 s log write never caught
++ * them. Before each step the log is written out now (herolte_ufs.c) and given 2 s, so the last line names the step
++ * that hangs, if one does.
++ */
++extern void herolte_log_kick(void);
++
++static bool
++au_step(int bit, const char *what)
++{
++	if (!(au_mask & bit)) {
++		printf("A50 AUDIO: step %s skipped (a50audio=%#x)\n", what, au_mask);
++		return false;
++	}
++	printf("A50 AUDIO: step %s next\n", what);
++	herolte_log_kick();
++	au_sleep_ms(2000);
++	return true;
++}
++
++static void
++au_probe(__unused void *arg, __unused wait_result_t wr)
++{
++	au_sleep_ms(30000);
++	if (!au_step(1, "CMU_TOP/CMU_DISPAUD")) {
++		return;
++	}
+ 	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000), dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
+ 	if (!top || !dispaud) {
+ 		printf("A50 AUDIO: CMU mapping failed\n");
+@@ -263,7 +296,7 @@ au_probe(__unused void *arg, __unused wait_result_t wr)
+ 	uint32_t aclk = au_rd(dispaud, 0x2020), smmu = au_rd(dispaud, 0x20b0);
+ 	if (au_gated_off(top_aud_gate) || au_gated_off(aclk)) {
+ 		printf("A50 AUDIO: ABOX's clock is held off (top %#x aclk %#x): ABOX not read\n", top_aud_gate, aclk);
+-	} else {
++	} else if (au_step(2, "ABOX registers")) {
+ 		vm_offset_t abox = ml_io_map(ABOX_PA, 0x4000);
+ 		if (abox) {
+ 			printf("A50 AUDIO: ABOX ip_index %#x version %#x\n", au_rd(abox, 0x0), au_rd(abox, 0x4));
+@@ -278,14 +311,17 @@ au_probe(__unused void *arg, __unused wait_result_t wr)
+ 	}
+ 	if (au_gated_off(smmu)) {
+ 		printf("A50 AUDIO: SMMU_ABOX's clock is held off (%#x): not read\n", smmu);
+-	} else {
++	} else if (au_step(4, "SMMU_ABOX registers")) {
+ 		vm_offset_t mmu = ml_io_map(SMMU_ABOX_PA, 0x1000);
+ 		if (mmu) {
+ 			au_dump("SMMU_ABOX", mmu, 0x0, 0x7c);
+ 		}
+ 	}
+-	au_probe_tfa();
++	if (au_step(8, "CMU_CMGP and hsi2c_3")) {
++		au_probe_tfa();
++	}
+ 	printf("A50 AUDIO: look done\n");
++	herolte_log_kick();
+ }
+ 
+ void
+@@ -293,7 +329,9 @@ a50_audio_start(void)
+ {
+ 	int on = 0;
+ 	thread_t thread;
++	/* a50audio=1: every step; otherwise a mask: 1 CMUs, 2 ABOX, 4 its SysMMU, 8 CMU_CMGP/hsi2c_3/TFA9872. */
+ 	PE_parse_boot_argn("a50audio", &on, sizeof(on));
++	au_mask = on == 1 ? 0xf : on;
+ 	if (on && kernel_thread_start(au_probe, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}
+diff --git a/bsd/dev/herolte_ufs.c b/bsd/dev/herolte_ufs.c
+index 6b2f98b..37c3a59 100644
+--- a/bsd/dev/herolte_ufs.c
++++ b/bsd/dev/herolte_ufs.c
+@@ -752,6 +752,14 @@ struct herolte_log_header {
+ 
+ static int herolte_log_chan;
+ 
++/* The log written out now rather than at the next 10 s: before a step that may hang the machine (a50_audio.c). */
++void herolte_log_kick(void);
++void
++herolte_log_kick(void)
++{
++	wakeup(&herolte_log_chan);
++}
++
+ static void
+ herolte_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
