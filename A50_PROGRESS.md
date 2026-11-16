@@ -982,8 +982,9 @@
   UAIF2, шины ABOX→DRAM, GPIO), пады, выводы, SYSPOWER, UAIF2 ведущий I2S
   16 бит стерео, маршрут, SBANK, RDMA0 как у прошивки; ~3 с читаются STATUS RDMA0 и
   UAIF2. Шаг 64 — во время тона TFA9872 включается по списку выше, затем
-  выключается. `a50audio=1` теперь = все шаги (0x7f); первый прогон — `0x3f`
-  (без усилителя), чтобы сначала увидеть, идёт ли DMA.
+  выключается. `a50audio=1` теперь = все шаги (0x7f); xnu22 сразу с `a50audio=1`
+  (тон тихий и короткий; если DMA не пойдёт, усилитель просто получит тишину).
+  `0x3f` — тот же тон без усилителя.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
