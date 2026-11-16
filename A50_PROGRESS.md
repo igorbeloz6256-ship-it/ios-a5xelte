@@ -912,6 +912,34 @@
   `a50audio`, 1 = все): 1 CMU_TOP/CMU_DISPAUD (9 + 28 регистров), 2 включить
   тактирование (TOP 0x2038, ABOX ACLK 0x2020/QCH 0x3014, SMMU_ABOX 0x20b0/0x3060),
   4 ABOX (27 регистров), 8 SysMMU ABOX (0x0/0x4/0x8), 16 CMGP + hsi2c_3 + TFA9872.
+  Коммит `1143626`: xnu 43835978120 — success, SHA256SUMS OK. `xnu21\boot.img`
+  (ADT и cmdline xnu20 с `a50audio=1`), sha256 `3b21478d…d4ba`, хост-прогон
+  проходит; записан в BOOT (чтение обратно совпало), reboot 2026-11-16 12:22:15.
+- **xnu21 на телефоне: проба прошла целиком, без зависания** (лог
+  `boot-xnu21.txt`, alive 1560 с). Значит, xnu20 вешали неописанные смещения
+  CMU. Значения:
+  - CMU_TOP: MUX/DIV/GATE CLKCMU_DISPAUD_AUD = 0x1 / 0 / 0x200000 (CG_VAL 1,
+    аппаратное управление), CPU — так же, DISP — 0 / 0 / 0x200000.
+  - **PLL_AUD работает: CON0 `0xa02d0110`** (ENABLE 1, STABLE 1, M 45, P 1, S 0),
+    CON3 K `0x5eff` (24319) → (45 + 24319/65536)·26 МГц = **1179,648 МГц**, как у
+    Linux при игре. LOCKTIME 0x79e. MUX_*_USER CON0 = 0x10 (своя частота).
+    CONTROLLER_OPTION 0x30000000. MUX AUD_CPU/CPU_HCH/UAIF2 = 0; DIV AUDIF 0x17
+    (/24 → 49,152 МГц), CPU 2, CPU_ACLK 1, PCLKDBG 7, **UAIF2 1**. Все гейты
+    0x200000; DMYQCH CPU 0x2; QCH S_ACLK / S_BCLK2 / SMMU = 0x3f0002 (ENABLE 0,
+    CLOCK_REQ 1). Включение гейтов (MANUAL + CG_VAL → 0x300000) прошло без
+    последствий.
+  - **ABOX: IP_INDEX `0x41424f58` («ABOX»), VERSION `0x01110000`**,
+    SYSPOWER_CTRL 0, SYSTEM_CONFIG0 0x4444, ROUTE_CTRL0–2 = 0, SPUS_CTRL0–3 = 0,
+    SIFS_CNT = 0, UAIF2_CTRL0 0x1000010, CTRL1 0, STATUS 0, TIMER0 0/0,
+    **RDMA7_CTRL0 0x400000**, остальное RDMA7 — 0, CPU_PC 0x100410a4,
+    L2C_STATUS 0.
+  - **SysMMU ABOX: CTRL 0x4 (бит 0 «включён» = 0 — трансляция выключена)**, 0x4 =
+    0x20000, 0x8 = 0.
+  - CMGP: MUX_CMGP_I2C 1 (шина CMGP), DIV 1; гейты 0x200000; QCH 0x3f0002.
+    gpm2/gpm3 CON = 0 (до настройки), hsi2c_3 CTL 0x8, CONF 0x980120ff, USI_CON 1.
+  - **TFA9872 отвечает: ревизия `0x3b72`.** Регистры 0x00–0x1F: 0001 0000 2828
+    3b72 0000 1f6a 0000 0000 | 0000 0000 0000 0000 0000 0ebe 0000 0000 | 001d
+    000c 0000 000f 0000 03ff 0100 0000 | нули (0x00 = 0x0001: PWDN, выключен).
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
