@@ -1,0 +1,377 @@
+diff --git a/bsd/dev/a50_audio.c b/bsd/dev/a50_audio.c
+index dabe66f..15e9e44 100644
+--- a/bsd/dev/a50_audio.c
++++ b/bsd/dev/a50_audio.c
+@@ -15,6 +15,21 @@
+  * (herolte_log_kick) and given 400 ms: if one hangs, the last line names it. Before ABOX and the SysMMU their clocks
+  * are asked for (gate held on by hand: MANUAL 20 + CG_VAL 21; Q-channel CLOCK_REQ, bit 1), each write logged the same.
+  * Writes: those gates and Q-channels, the two pins' CON/PUD fields, the HSI2C controller, TFA9872 register addresses.
++ *
++ * Step 2 of sound (xnu22): a test tone straight through the hardware, without ABOX's firmware (calliope). Android's
++ * speaker path is RDMA -> SPUS -> SIFS1 -> UAIF2 -> TFA9872 (mixer_paths.xml); Linux starts RDMA by IPC, so the
++ * RDMA register layout comes from the firmware's own register helpers (calliope_sram.bin 0x21fc-0x2496: CTRL0 ENABLE
++ * 0, bit 4, bit 5 = 1, FORMAT 12:8, bit 13 mono expand, 18:16 = 0, BURST 22:19; BUF_STR 0x08, BUF_END 0x0C,
++ * BUF_OFFSET 0x10 (15:4), STR_POINT 0x14, VOL_FACTOR 0x18 = 0x800000, VOL_CHANGE 0x1C = 0, STATUS 0x30) and its
++ * SPUS SBANK helpers (0x220 + 4 x RDMA: start 13:7, size 28:23; 9820's driver writes size << 16 | start, bytes).
++ * Step 32: CMU (AUDIF 24.576 MHz as Linux, UAIF2 BCLK 1.536 MHz = 48 kHz x 2 x 16 bits; UAIF2, bus to DRAM and GPIO
++ * gates on), PMU pad retention off (0x3048 bit 28), pins gpb2-0..3 function 2 (aud_i2s2_bus), ABOX SYSPOWER (DRAM
++ * on), UAIF2 master I2S 16-bit stereo, route UAIF2 SPK = SIFS1, SIFS1 = SPUS OUT0, RDMA0 over a 1 kHz tone at
++ * -24 dBFS in contiguous DRAM (SysMMU ABOX is off, so bus address = physical), then UAIF2 SPK_ENABLE and RDMA/UAIF
++ * status read back for ~3 s. Step 64: TFA9872 as tfa98xx would: I2C reset, its 0x3b72 register list
++ * (tfa_init.c tfa9872_specific), the device and "music" profile bit fields of Tfa9872.cnt (TDM 2 slots of 16 bits,
++ * speaker on slot 0, 48 kHz, AMPE, DCA), PWDN 0, MANSCONF 1; status read while the tone plays, then powered down.
++ * No speaker protection runs (it is ABOX firmware), hence the quiet tone and only a few seconds.
+  */
+ #if defined(ARM64_BOARD_CONFIG_A50)
+ #include <sys/param.h>
+@@ -23,9 +38,13 @@
+ #include <kern/sched_prim.h>
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
+ #include <pexpert/pexpert.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
+ extern void herolte_log_kick(void);
+ void a50_audio_start(void);
+ 
+@@ -39,6 +58,40 @@ void a50_audio_start(void);
+ #define GPM2                    0x040u
+ #define GPM3                    0x060u
+ #define TFA_ADDR                0x34u
++#define PMU_PA                  0x11860000u
++#define PMU_PAD_RET_ABOX        0x3048u
++#define GPIO_DISPAUD_PA         0x14a60000u
++#define GPB2                    0x040u
++
++/* ABOX (abox.h; RDMA fields from the firmware, see above). */
++#define ABOX_SYSPOWER_CTRL      0x010u
++#define ABOX_QCHANNEL_DISABLE   0x038u
++#define ABOX_ROUTE_CTRL0        0x040u
++#define ABOX_SPUS_CTRL0         0x200u
++#define ABOX_SPUS_CTRL1         0x204u
++#define ABOX_SBANK_RDMA0        0x220u
++#define ABOX_UAIF2_CTRL0        0x520u
++#define ABOX_UAIF2_CTRL1        0x524u
++#define ABOX_UAIF2_STATUS       0x52cu
++#define RDMA0                   0x1000u
++#define RDMA_CTRL0              0x00u
++#define RDMA_CTRL1              0x04u
++#define RDMA_BUF_STR            0x08u
++#define RDMA_BUF_END            0x0cu
++#define RDMA_BUF_OFFSET         0x10u
++#define RDMA_STR_POINT          0x14u
++#define RDMA_VOL_FACTOR         0x18u
++#define RDMA_VOL_CHANGE         0x1cu
++#define RDMA_STATUS             0x30u
++#define TONE_ALLOC              0x4000u
++#define TONE_BYTES              0x3000u /* 64 periods of 1 kHz at 48 kHz, 16-bit stereo */
++
++/* TFA9872 bit fields (tfa9872_tfafieldnames.h): register << 8 | position << 4 | length - 1. */
++#define TFA_PWDN                0x0000u
++#define TFA_MANSCONF            0x0120u
++#define TFA_MANAOOSC            0x0140u
++#define TFA_INTSMUTE            0x5110u
++#define TFA_MTPK                0xa107u
+ 
+ #define HSI2C_CTL               0x00u
+ #define HSI2C_FIFO_CTL          0x04u
+@@ -113,9 +166,33 @@ static const struct au_reg au_cmgp_regs[] = {
+ };
+ 
+ static vm_offset_t au_i2c;
++static bool au_tfa_ok;
+ static int au_sleep_chan;
+ static int au_mask;
+ 
++/* One period of 1 kHz at 48 kHz, amplitude 2048 (-24 dBFS). */
++static const int16_t au_sine[48] = {
++	0, 267, 530, 784, 1024, 1247, 1448, 1625, 1774, 1892, 1978, 2030, 2048, 2030, 1978, 1892, 1774, 1625, 1448, 1247,
++	1024, 784, 530, 267, 0, -267, -530, -784, -1024, -1247, -1448, -1625, -1774, -1892, -1978, -2030, -2048, -2030,
++	-1978, -1892, -1774, -1625, -1448, -1247, -1024, -784, -530, -267,
++};
++
++/* Device list of Tfa9872.cnt (Samsung A50), then the "music" profile up to its default section. */
++static const uint16_t au_tfa_dev_fields[][2] = {
++	{ 0x20c3, 0 }, { 0x2144, 15 }, { 0x2224, 15 }, { 0x2103, 1 }, { 0x2330, 1 }, { 0x2340, 1 }, { 0x2603, 0 },
++	{ 0x26c3, 0 }, { 0x2703, 1 }, { 0x6801, 2 }, { 0x6821, 1 }, { 0x6841, 2 }, { 0x6110, 1 }, { 0x6365, 27 },
++	{ 0x6565, 0 }, { 0x7033, 12 }, { 0x6163, 6 }, { 0x7444, 7 }, { 0x7534, 5 }, { 0x7402, 4 }, { 0x7002, 5 },
++	{ 0x0580, 0 }, { 0x0560, 0 }, { 0x5170, 0 }, { 0x52e0, 1 },
++	{ 0x0203, 8 }, { 0x0030, 1 }, { 0x64e1, 1 }, { 0x62e1, 0 }, { 0x0040, 1 }, { 0x52e0, 1 },
++};
++
++/* tfa_init.c tfa9872_specific, revisions 0x1b72/0x2b72/0x3b72 (N1B2 version 21). */
++static const uint16_t au_tfa_n1b2_regs[][2] = {
++	{ 0x02, 0x2dc8 }, { 0x20, 0x0890 }, { 0x22, 0x043c }, { 0x23, 0x0001 }, { 0x51, 0x0000 }, { 0x52, 0x5a1c },
++	{ 0x61, 0x0198 }, { 0x63, 0x0a9a }, { 0x65, 0x0a82 }, { 0x6f, 0x01e3 }, { 0x70, 0x06fd }, { 0x71, 0x307e },
++	{ 0x74, 0xcc84 }, { 0x75, 0x1132 }, { 0x82, 0x01ed }, { 0x83, 0x001a },
++};
++
+ static uint32_t
+ au_rd(vm_offset_t base, uint32_t off)
+ {
+@@ -170,6 +247,14 @@ au_write_logged(const char *what, vm_offset_t base, uint32_t off, uint32_t v)
+ 	printf("A50 AUDIO: %s +%#x now %#x\n", what, off, au_rd(base, off));
+ }
+ 
++/* Read, change the bits of mask to value, write: both logged. */
++static void
++au_update_logged(const char *what, vm_offset_t base, uint32_t off, uint32_t mask, uint32_t value)
++{
++	uint32_t v = au_read_logged(what, base, off);
++	au_write_logged(what, base, off, (v & ~mask) | (value & mask));
++}
++
+ static void
+ au_read_table(vm_offset_t base, const struct au_reg *regs, unsigned n)
+ {
+@@ -301,6 +386,90 @@ au_tfa_read(uint8_t reg, uint16_t *value)
+ 	return false;
+ }
+ 
++static bool
++au_tfa_write(uint8_t reg, uint16_t value)
++{
++	uint8_t b[3] = { reg, (uint8_t)(value >> 8), (uint8_t)value };
++	bool ok = au_message(false, b, 3, true);
++	printf("A50 AUDIO: TFA9872 write %#04x = %#06x%s\n", reg, value, ok ? "" : " FAILED");
++	return ok;
++}
++
++/* A bit field as tfa_set_bf: read, replace the field, write. */
++static bool
++au_tfa_bf(uint16_t field, uint16_t value)
++{
++	uint8_t reg = (uint8_t)(field >> 8);
++	unsigned pos = (field >> 4) & 0xfu, len = (field & 0xfu) + 1;
++	uint16_t mask = (uint16_t)(((1u << len) - 1) << pos), v;
++	if (!au_tfa_read(reg, &v)) {
++		printf("A50 AUDIO: TFA9872 read %#04x for field %#06x FAILED\n", reg, field);
++		return false;
++	}
++	return au_tfa_write(reg, (uint16_t)((v & ~mask) | ((uint16_t)(value << pos) & mask)));
++}
++
++static void
++au_tfa_status(const char *when)
++{
++	uint16_t s[5] = { 0 };
++	static const uint8_t regs[5] = { 0x00, 0x10, 0x11, 0x13, 0x14 };
++	for (unsigned i = 0; i < 5; i++) {
++		(void)au_tfa_read(regs[i], &s[i]);
++	}
++	printf("A50 AUDIO: TFA9872 %s: 00=%04x 10=%04x 11=%04x 13=%04x 14=%04x (MANSTATE %u)\n", when, s[0], s[1], s[2],
++	    s[3], s[4], (s[4] >> 3) & 0xfu);
++}
++
++/* tfa_run_startup without the DSP parts: init, device and profile settings, out of power-down, MANSCONF. */
++static void
++au_tfa_power_up(void)
++{
++	uint16_t rev = 0, key = 0;
++	printf("A50 AUDIO: TFA9872 power-up next\n");
++	au_kick(400);
++	au_tfa_status("before");
++	(void)au_tfa_write(0x00, 0x0002);       /* I2CR: registers to their defaults */
++	delay(10000);
++	(void)au_tfa_read(0x03, &rev);
++	/* Unlock key 1 and 2 (tfa9872_specific, tfa98xx_key2). */
++	(void)au_tfa_write(0x0f, 0x5a6b);
++	(void)au_tfa_read(0xfb, &key);
++	(void)au_tfa_write(0xa0, key ^ 0x005a);
++	(void)au_tfa_write(0x0f, 0x5a6b);
++	(void)au_tfa_bf(TFA_MTPK, 0x5a);
++	(void)au_tfa_write(0x0f, 0x0000);
++	if ((rev & 0x0fffu) == 0x0b72) {
++		for (unsigned i = 0; i < sizeof(au_tfa_n1b2_regs) / sizeof(au_tfa_n1b2_regs[0]); i++) {
++			(void)au_tfa_write((uint8_t)au_tfa_n1b2_regs[i][0], au_tfa_n1b2_regs[i][1]);
++		}
++	} else {
++		printf("A50 AUDIO: TFA9872 revision %#06x: no register list\n", rev);
++	}
++	(void)au_tfa_bf(TFA_MANAOOSC, 1);
++	uint16_t b0 = 0;
++	if (au_tfa_read(0xb0, &b0)) {
++		(void)au_tfa_write(0xb0, b0 | (1u << 3));       /* bypass OVP */
++	}
++	for (unsigned i = 0; i < sizeof(au_tfa_dev_fields) / sizeof(au_tfa_dev_fields[0]); i++) {
++		(void)au_tfa_bf(au_tfa_dev_fields[i][0], au_tfa_dev_fields[i][1]);
++	}
++	au_tfa_status("set up");
++	(void)au_tfa_bf(TFA_PWDN, 0);
++	(void)au_tfa_bf(TFA_MANSCONF, 1);
++	(void)au_tfa_bf(TFA_INTSMUTE, 0);
++	au_kick(10);
++}
++
++static void
++au_tfa_power_down(void)
++{
++	(void)au_tfa_bf(TFA_INTSMUTE, 1);
++	(void)au_tfa_bf(TFA_MANSCONF, 0);
++	(void)au_tfa_bf(TFA_PWDN, 1);
++	au_tfa_status("powered down");
++}
++
+ static void
+ au_probe_tfa(void)
+ {
+@@ -333,6 +502,7 @@ au_probe_tfa(void)
+ 		return;
+ 	}
+ 	printf("A50 AUDIO: TFA9872 revision %#06x\n", rev);
++	au_tfa_ok = true;
+ 	for (unsigned reg = 0x00; reg < 0x20; reg += 8) {
+ 		uint16_t v[8] = { 0 };
+ 		for (unsigned i = 0; i < 8; i++) {
+@@ -343,6 +513,122 @@ au_probe_tfa(void)
+ 	}
+ }
+ 
++static void
++au_tone_poll(vm_offset_t abox, unsigned i)
++{
++	printf("A50 AUDIO: tone %u: RDMA0 CTRL0 %#x STATUS %#x, UAIF2 CTRL0 %#x STATUS %#x\n", i,
++	    au_rd(abox, RDMA0 + RDMA_CTRL0), au_rd(abox, RDMA0 + RDMA_STATUS), au_rd(abox, ABOX_UAIF2_CTRL0),
++	    au_rd(abox, ABOX_UAIF2_STATUS));
++}
++
++/* Step 32: RDMA0 -> SPUS OUT0 -> SIFS1 -> UAIF2 with a 1 kHz tone; step 64 turns the amplifier on meanwhile. */
++static void
++au_tone(void)
++{
++	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000), dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
++	vm_offset_t abox = ml_io_map(ABOX_PA, 0x4000), pmu = ml_io_map(PMU_PA + 0x3000, 0x1000);
++	vm_offset_t gpio = ml_io_map(GPIO_DISPAUD_PA, 0x1000), buf = 0;
++	if (!top || !dispaud || !abox || !pmu || !gpio) {
++		printf("A50 AUDIO: tone mapping failed\n");
++		return;
++	}
++	if (kmem_alloc_contig(kernel_map, &buf, TONE_ALLOC, PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO,
++	    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++		printf("A50 AUDIO: no contiguous memory for the tone\n");
++		return;
++	}
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)buf);
++	uint64_t pa = ptoa_64(pn);
++	if (!pn || pa + TONE_ALLOC > 0x100000000ULL) {
++		printf("A50 AUDIO: tone buffer at %#llx, out of ABOX's reach\n", pa);
++		return;
++	}
++	int16_t *samples = (int16_t *)buf;
++	for (unsigned i = 0; i < TONE_BYTES / 4; i++) {
++		samples[2 * i] = samples[2 * i + 1] = au_sine[i % 48];
++	}
++	flush_dcache64((addr64_t)pa, TONE_BYTES, TRUE);
++	uint32_t pa32 = (uint32_t)pa;
++	printf("A50 AUDIO: tone buffer pa %#x, %u bytes\n", pa32, TONE_BYTES);
++
++	/* Clocks: the audio side and ABOX's bus (if step 2 did not), UAIF2's BCLK, ABOX's path to DRAM, its GPIO. */
++	if (!(au_mask & 2)) {
++		au_clock_on("TOP GATE_CLKCMU_DISPAUD_AUD", top, 0x2038, 0);
++		au_clock_on("ABOX ACLK", dispaud, 0x2020, 0x3014);
++	}
++	au_clock_on("GAT ABOX BCLK_UAIF2", dispaud, 0x2008, 0x3020);
++	au_clock_on("GAT RSTNSYNC AUD_UAIF2", dispaud, 0x2018, 0);
++	au_clock_on("GAT LHS_AXI_D_ABOX", dispaud, 0x2078, 0x304c);
++	au_clock_on("GAT PPMU_ABOX ACLK", dispaud, 0x2084, 0x3050);
++	au_clock_on("GAT PPMU_ABOX PCLK", dispaud, 0x2088, 0);
++	au_clock_on("GAT GPIO_DISPAUD", dispaud, 0x206c, 0x3040);
++	/* AUDIF 1179.648 / 48 = 24.576 MHz (Linux AUDIF_RATE_HZ), UAIF2 BCLK / 16 = 1.536 MHz, from the divider. */
++	au_update_logged("DIV_CLK_AUD_AUDIF", dispaud, 0x1800, 0x1ffu, 47);
++	au_update_logged("DIV_CLK_AUD_UAIF2", dispaud, 0x182c, 0x1ffu, 15);
++	au_update_logged("MUX_CLK_AUD_UAIF2", dispaud, 0x1018, 1u, 0);
++
++	/* Audio pads out of retention, UAIF2 pins (aud_i2s2_bus: gpb2-0..3 function 2, pull-down). */
++	au_update_logged("PMU PAD_RETENTION_ABOX_OPTION", pmu, PMU_PAD_RET_ABOX & 0xfffu, 0x10000000u, 0x10000000u);
++	(void)au_read_logged("GPIO gpb0 CON", gpio, 0x000);
++	(void)au_read_logged("GPIO gpb1 CON", gpio, 0x020);
++	au_update_logged("GPIO gpb2 CON", gpio, GPB2, 0xffffu, 0x2222u);
++	au_update_logged("GPIO gpb2 PUD", gpio, GPB2 + 8, 0xffffu, 0x1111u);
++
++	/* ABOX: DRAM on, UAIF2 BCLK Q-channel kept running, UAIF2 master I2S 16-bit stereo, routing. */
++	au_update_logged("ABOX SYSPOWER_CTRL", abox, ABOX_SYSPOWER_CTRL, 1u, 1u);
++	au_update_logged("ABOX QCHANNEL_DISABLE", abox, ABOX_QCHANNEL_DISABLE, 1u << 4, 1u << 4);
++	au_update_logged("ABOX UAIF2_CTRL0", abox, ABOX_UAIF2_CTRL0, 0x5u, 0x4u);      /* MODE master, SPK off */
++	/* FORMAT 0x9 (16 bits, 2 ch), BCLK_POLARITY 1 (NB_NF), I2S, SLOT_MAX 1, SBIT_MAX 15. */
++	au_update_logged("ABOX UAIF2_CTRL1", abox, ABOX_UAIF2_CTRL1, 0xffffffffu, 0x0984f000u);
++	au_update_logged("ABOX ROUTE_CTRL0", abox, ABOX_ROUTE_CTRL0, 0xf00u, 0x200u);   /* UAIF2 SPK = SIFS1 */
++	au_update_logged("ABOX SPUS_CTRL0", abox, ABOX_SPUS_CTRL0, 0xfu, 0);            /* RDMA0 -> OUT0 -> SIFS1 */
++	au_update_logged("ABOX SPUS_CTRL1", abox, ABOX_SPUS_CTRL1, 0x70000u, 0);        /* SIFS1 = SPUS OUT0 */
++	au_update_logged("ABOX SBANK_RDMA0", abox, ABOX_SBANK_RDMA0, 0xffffffffu, 0x02000000u); /* 512 bytes at 0 */
++
++	/* RDMA0 as the firmware's setup: volume, buffer, burst 8, format 0x9, bit 5; then enable. */
++	(void)au_read_logged("ABOX RDMA0_CTRL1", abox, RDMA0 + RDMA_CTRL1);
++	(void)au_read_logged("ABOX RDMA0_STATUS", abox, RDMA0 + RDMA_STATUS);
++	au_update_logged("ABOX RDMA0_VOL_FACTOR", abox, RDMA0 + RDMA_VOL_FACTOR, 0xffffffu, 0x800000u);
++	au_update_logged("ABOX RDMA0_VOL_CHANGE", abox, RDMA0 + RDMA_VOL_CHANGE, 0xffffffu, 0);
++	au_update_logged("ABOX RDMA0_CTRL0", abox, RDMA0 + RDMA_CTRL0, 0x70000u, 0);
++	au_update_logged("ABOX RDMA0_BUF_STR", abox, RDMA0 + RDMA_BUF_STR, ~0xfu, pa32);
++	au_update_logged("ABOX RDMA0_BUF_END", abox, RDMA0 + RDMA_BUF_END, ~0xfu, pa32 + TONE_BYTES);
++	au_update_logged("ABOX RDMA0_STR_POINT", abox, RDMA0 + RDMA_STR_POINT, ~0xfu, pa32);
++	au_update_logged("ABOX RDMA0_BUF_OFFSET", abox, RDMA0 + RDMA_BUF_OFFSET, 0xfff0u, TONE_BYTES / 2);
++	au_update_logged("ABOX RDMA0_CTRL0", abox, RDMA0 + RDMA_CTRL0,
++	    (0xfu << 19) | (0x1fu << 8) | (1u << 13) | (1u << 5) | (1u << 4), (8u << 19) | (0x9u << 8) | (1u << 5));
++	au_update_logged("ABOX RDMA0_CTRL0 enable", abox, RDMA0 + RDMA_CTRL0, 1u, 1u);
++	au_tone_poll(abox, 0);
++	au_update_logged("ABOX UAIF2_CTRL0 SPK_ENABLE", abox, ABOX_UAIF2_CTRL0, 1u, 1u);
++	for (unsigned i = 1; i <= 3; i++) {
++		au_sleep_ms(100);
++		au_tone_poll(abox, i);
++	}
++	bool amp = false;
++	if ((au_mask & 64) && au_tfa_ok) {
++		au_tfa_power_up();
++		amp = true;
++	} else if (au_mask & 64) {
++		printf("A50 AUDIO: TFA9872 not set up (step 16), amplifier stays off\n");
++	}
++	for (unsigned i = 4; i <= 13; i++) {
++		au_sleep_ms(300);
++		au_tone_poll(abox, i);
++		if (amp && (i == 5 || i == 9)) {
++			au_tfa_status("playing");
++		}
++	}
++	au_kick(10);
++	if (amp) {
++		au_tfa_power_down();
++	}
++	au_update_logged("ABOX UAIF2_CTRL0 SPK off", abox, ABOX_UAIF2_CTRL0, 1u, 0);
++	au_update_logged("ABOX RDMA0_CTRL0 disable", abox, RDMA0 + RDMA_CTRL0, 1u, 0);
++	au_sleep_ms(50);
++	au_tone_poll(abox, 99);
++	printf("A50 AUDIO: tone done\n");
++}
++
+ static void
+ au_probe(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -377,6 +663,9 @@ au_probe(__unused void *arg, __unused wait_result_t wr)
+ 	if (au_step(16, "CMU_CMGP, hsi2c_3, TFA9872")) {
+ 		au_probe_tfa();
+ 	}
++	if (au_step(32, "test tone (64: with TFA9872)")) {
++		au_tone();
++	}
+ 	printf("A50 AUDIO: look done\n");
+ 	herolte_log_kick();
+ }
+@@ -386,9 +675,12 @@ a50_audio_start(void)
+ {
+ 	int on = 0;
+ 	thread_t thread;
+-	/* a50audio=1: every step; otherwise a mask: 1 CMUs, 2 clocks on, 4 ABOX, 8 its SysMMU, 16 CMGP/hsi2c_3/TFA9872. */
++	/*
++	 * a50audio=1: every step; otherwise a mask: 1 CMUs, 2 clocks on, 4 ABOX, 8 its SysMMU, 16 CMGP/hsi2c_3/TFA9872,
++	 * 32 test tone through ABOX, 64 TFA9872 on during the tone (needs 16).
++	 */
+ 	PE_parse_boot_argn("a50audio", &on, sizeof(on));
+-	au_mask = on == 1 ? 0x1f : on;
++	au_mask = on == 1 ? 0x7f : on;
+ 	if (on && kernel_thread_start(au_probe, NULL, &thread) == KERN_SUCCESS) {
+ 		thread_deallocate(thread);
+ 	}

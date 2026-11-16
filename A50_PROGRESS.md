@@ -940,6 +940,50 @@
   - **TFA9872 отвечает: ревизия `0x3b72`.** Регистры 0x00–0x1F: 0001 0000 2828
     3b72 0000 1f6a 0000 0000 | 0000 0000 0000 0000 0000 0ebe 0000 0000 | 001d
     000c 0000 000f 0000 03ff 0100 0000 | нули (0x00 = 0x0001: PWDN, выключен).
+- **Регистры RDMA из самой прошивки ABOX** (abox.h их не описывает: у Linux RDMA
+  настраивает calliope). `calliope_dram.bin` грузится по IOVA `0x80000000`,
+  `calliope_sram.bin` — с 0; функция настройки RDMA — dram `0x90c` (рядом строки
+  «RDMA format was set»), она зовёт через переходники sram-помощники
+  `0x21fc–0x2496` (база `0x14A51000 + id·0x100`): CTRL0 — ENABLE 0, бит 4 (флаг
+  буфера), бит 5 (всегда 1), **FORMAT 12:8** (как `abox_get_format`: 16 бит
+  стерео = 0x9), бит 13 «expand» (только при формате 0x8, моно), 18:16 = 0,
+  **BURST 22:19** (8; у RDMA7 — 4), бит 23; CTRL1 = 1 (отдельно); BUF_STR 0x08,
+  BUF_END 0x0C (адрес+размер), BUF_OFFSET 0x10 (поле 15:4), STR_POINT 0x14 (адрес),
+  VOL_FACTOR 0x18 = **0x800000** (по умолчанию, dram `0x16a2`), VOL_CHANGE 0x1C =
+  0; STATUS 0x30 (CNT 12:0, OFFSET 28:16, PROGRESS 31). Порядок: громкость, 18:16,
+  буфер, BUF_OFFSET, burst, формат, бит 5, бит 4, expand, затем ENABLE.
+- **SBANK** (буфер SPUS внутри ABOX для каждого RDMA): `0x220 + 4·x`, начало
+  13:7, размер 28:23 (sram `0x26a6–0x2734`; ASRC — `0x240`, MIXP — `0x260`); после
+  сброса 0, ставит прошивка из своей таблицы. У 9820 драйвер пишет
+  `размер << 16 | начало` в байтах (512 на RDMA) — берём `0x02000000` для RDMA0.
+  SPUS_CTRL1 у прошивки: MIXP 4:0, SIFS1 18:16, SIFS2 21:19, SIFSM 24:22.
+- **Звук у Linux, чего ещё не хватало:** AUDIF ставится на **24,576 МГц**
+  (`AUDIF_RATE_HZ`, делитель 48), BCLK UAIF2 = делитель CMU (`rate·ch·width`);
+  `abox_request_dram_on` — SYSPOWER_CTRL = 1; `abox_pad_retention(false)` — PMU
+  `0x11860000 + 0x3048` бит 28; выводы UAIF2 — `aud_i2s2_bus` = **gpb2-0..3
+  функция 2**, pull-down (pinctrl `0x14A60000`); `uaif@2` в
+  `exynos9610-a50_sound.dtsi` — I2S без `bitclock-master` → **ABOX ведущий** (MODE
+  1), NB_NF → BCLK_POLARITY 1. Out1 (SIFS1) в TWRP: 48 кГц, 16 бит.
+- **TFA9872 без DSP** (tfa98xx Samsung, `tfa_dsp.c tfa_run_startup`): I2CR →
+  ключи (0x0F = 0x5A6B, 0xA0 = [0xFB] ^ 0x5A, MTPK 0xA1 = 0x5A, 0x0F = 0) →
+  список регистров ревизии 0x3b72 (`tfa9872_specific`) → MANAOOSC, 0xB0 бит 3 →
+  поля устройства из `Tfa9872.cnt` → поля профиля «music» → PWDN 0 → MANSCONF 1.
+  **`Tfa9872.cnt`** (PM3, «Samsung/TFA/mono», 1 устройство 0x34, профили music и
+  mono.cal): TDMNBCK 0, **TDMSLLN 15, TDMSSIZE 15, TDMSLOTS 1** (2 слота по 16
+  бит), TDMCSE/TDMVSE 1 (обратная связь тока/напряжения в ABOX), **TDMSPKS 0**
+  (динамик — слот 0), TDMVSS 1, SRCMAP 2/1/2, LPM0BYP 1, TDMSPKG 6, DCMCC 12,
+  DCTRIP 7, DCTRIP2 5, DCVOF 4, DCVOS 5, PGAE 0, SSPDME 0, DPSA 0, SLOPESET 1;
+  music: **AUDFS 8 (48 кГц), AMPE 1, DCA 1**, LPM1MODE 1, LNMODE 0. Остальное в
+  контейнере — команды и файлы для DSP на ABOX (защита динамика), без него
+  громкость регистром не задаётся (поля VOL у 9872 нет).
+- **0417 (xnu22, пробный тон):** шаг 32 — RDMA0 → SPUS OUT0 → SIFS1 → UAIF2 с
+  тоном 1 кГц −24 dBFS (12 КБ в непрерывной памяти, SysMMU ABOX выключен — адрес
+  физический), тактирование (AUDIF 24,576 МГц, UAIF2 /16 = 1,536 МГц, гейты BCLK
+  UAIF2, шины ABOX→DRAM, GPIO), пады, выводы, SYSPOWER, UAIF2 ведущий I2S
+  16 бит стерео, маршрут, SBANK, RDMA0 как у прошивки; ~3 с читаются STATUS RDMA0 и
+  UAIF2. Шаг 64 — во время тона TFA9872 включается по списку выше, затем
+  выключается. `a50audio=1` теперь = все шаги (0x7f); первый прогон — `0x3f`
+  (без усилителя), чтобы сначала увидеть, идёт ли DMA.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
