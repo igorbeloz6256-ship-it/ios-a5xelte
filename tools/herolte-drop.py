@@ -9,11 +9,19 @@ boot as root (launchd job com.herolte.autorun, tools/herolte-tune-ios-root.sh).
 
   herolte-drop.py ADB autorun=build/herogpu-test [lib/libfoo.dylib=out/libfoo.dylib ...]
   herolte-drop.py ADB ... app=Foo.ipa app=Bar.app
+  herolte-drop.py ADB --dev /dev/block/by-name/userdata hal=mesa-ios/artifact/audio
   herolte-drop.py ADB --clear
 
 DEST=SRC: DEST is relative to /private/var/herolte/ (directories are created);
 files keep SRC's executable bit (mode 0755 or 0644). Run with the phone in
 TWRP, /data unmounted.
+
+hal=DIR: the audio plug-in of mediaserverd (the mesa-ios artifact's audio/:
+HakiosAudio and Info.plist) goes to
+/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver, the one place outside
+/private/var/herolte/ the kernel writes to (Galaxy A50: no hero-run there).
+mediaserverd loads it as it starts, so from the boot after the one that
+installs it.
 
 app=FILE.ipa or app=DIR.app: an iOS app (arm64) goes to apps/NAME.app, and
 hero-run moves it to /Applications and registers it with LaunchServices on
@@ -116,6 +124,20 @@ BLOCK = 4096
 LOG_BLOCKS = 1 + (4 << 20) // BLOCK
 DROP_BLOCKS = 32768
 PREFIX = '/private/var/herolte/'
+HAL_DRIVER = '/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver'
+HAL_FILES = ('HakiosAudio', 'Info.plist')
+
+
+def hal_items(src):
+    """Entries (path, mode, data) for the plug-in bundle from DIR, at HDROP_HAL_DRIVER (herolte_drop.c)."""
+    out = [(HAL_DRIVER, 0, b'')]
+    for name in HAL_FILES:
+        path = os.path.join(src, name)
+        if not os.path.isfile(path):
+            sys.exit(f'hal={src}: no {name} there')
+        data = open(path, 'rb').read()
+        out.append((f'{HAL_DRIVER}/{name}', 0o755 if macho_slices(data) else 0o644, data))
+    return out
 
 
 def adb(tool, *args, data=None):
@@ -132,6 +154,9 @@ def pack(items):
         if dest == 'app':
             files += app_items(src)
             have_apps = True
+            continue
+        if dest == 'hal':
+            entries += hal_items(src)
             continue
         data = open(src, 'rb').read()
         mode = 0o755 if os.access(src, os.X_OK) or dest == 'autorun' else 0o644

@@ -1,0 +1,559 @@
+diff --git a/bsd/dev/a50_audio.c b/bsd/dev/a50_audio.c
+index 60addb6..d9d897b 100644
+--- a/bsd/dev/a50_audio.c
++++ b/bsd/dev/a50_audio.c
+@@ -31,6 +31,9 @@
+  * (tfa_init.c tfa9872_specific), the device and "music" profile bit fields of Tfa9872.cnt (TDM 2 slots of 16 bits,
+  * speaker on slot 0, 48 kHz, AMPE, DCA), PWDN 0, MANSCONF 1; status read while the tone plays, then powered down.
+  * No speaker protection runs (it is ABOX firmware), hence the quiet tone and only a few seconds.
++ *
++ * xnu23 played it, loud enough: RDMA0 runs without calliope. Step 3 (boot-arg a50sound=1, instead of a50audio): the
++ * same path for iOS, as /dev/hakios-audio (see as_thread below).
+  */
+ #if defined(ARM64_BOARD_CONFIG_A50)
+ #include <sys/param.h>
+@@ -40,6 +43,15 @@
+ #include <kern/thread.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
++#include <kern/locks.h>
++#include <mach/mach_time.h>
++#include <miscfs/devfs/devfs.h>
++#include <sys/conf.h>
++#include <sys/errno.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <string.h>
+ 
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void herolte_log_kick(void);
+@@ -218,10 +230,19 @@ au_sleep_ms(unsigned ms)
+ 	thread_block(THREAD_CONTINUE_NULL);
+ }
+ 
++/*
++ * a50sound=1 (the sink): every register below is known good from xnu23, so they are set without a line and a wait
++ * each. The probe (a50audio) keeps both.
++ */
++static bool au_quiet;
++
+ /* The log written out now (herolte_ufs.c) and given time to reach the disk. */
+ static void
+ au_kick(unsigned ms)
+ {
++	if (au_quiet) {
++		return;
++	}
+ 	herolte_log_kick();
+ 	au_sleep_ms(ms);
+ }
+@@ -230,6 +251,9 @@ au_kick(unsigned ms)
+ static uint32_t
+ au_read_logged(const char *what, vm_offset_t base, uint32_t off)
+ {
++	if (au_quiet) {
++		return au_rd(base, off);
++	}
+ 	printf("A50 AUDIO: read %s +%#x next\n", what, off);
+ 	au_kick(400);
+ 	uint32_t v = au_rd(base, off);
+@@ -241,6 +265,10 @@ au_read_logged(const char *what, vm_offset_t base, uint32_t off)
+ static void
+ au_write_logged(const char *what, vm_offset_t base, uint32_t off, uint32_t v)
+ {
++	if (au_quiet) {
++		au_wr(base, off, v);
++		return;
++	}
+ 	printf("A50 AUDIO: write %s +%#x = %#x next\n", what, off, v);
+ 	au_kick(400);
+ 	au_wr(base, off, v);
+@@ -391,7 +419,9 @@ au_tfa_write(uint8_t reg, uint16_t value)
+ {
+ 	uint8_t b[3] = { reg, (uint8_t)(value >> 8), (uint8_t)value };
+ 	bool ok = au_message(false, b, 3, true);
+-	printf("A50 AUDIO: TFA9872 write %#04x = %#06x%s\n", reg, value, ok ? "" : " FAILED");
++	if (!au_quiet || !ok) {
++		printf("A50 AUDIO: TFA9872 write %#04x = %#06x%s\n", reg, value, ok ? "" : " FAILED");
++	}
+ 	return ok;
+ }
+ 
+@@ -426,9 +456,11 @@ static void
+ au_tfa_power_up(void)
+ {
+ 	uint16_t rev = 0, key = 0;
+-	printf("A50 AUDIO: TFA9872 power-up next\n");
+-	au_kick(400);
+-	au_tfa_status("before");
++	if (!au_quiet) {
++		printf("A50 AUDIO: TFA9872 power-up next\n");
++		au_kick(400);
++		au_tfa_status("before");
++	}
+ 	(void)au_tfa_write(0x00, 0x0002);       /* I2CR: registers to their defaults */
+ 	delay(10000);
+ 	(void)au_tfa_read(0x03, &rev);
+@@ -454,7 +486,9 @@ au_tfa_power_up(void)
+ 	for (unsigned i = 0; i < sizeof(au_tfa_dev_fields) / sizeof(au_tfa_dev_fields[0]); i++) {
+ 		(void)au_tfa_bf(au_tfa_dev_fields[i][0], au_tfa_dev_fields[i][1]);
+ 	}
+-	au_tfa_status("set up");
++	if (!au_quiet) {
++		au_tfa_status("set up");
++	}
+ 	(void)au_tfa_bf(TFA_PWDN, 0);
+ 	(void)au_tfa_bf(TFA_MANSCONF, 1);
+ 	(void)au_tfa_bf(TFA_INTSMUTE, 0);
+@@ -467,7 +501,9 @@ au_tfa_power_down(void)
+ 	(void)au_tfa_bf(TFA_INTSMUTE, 1);
+ 	(void)au_tfa_bf(TFA_MANSCONF, 0);
+ 	(void)au_tfa_bf(TFA_PWDN, 1);
+-	au_tfa_status("powered down");
++	if (!au_quiet) {
++		au_tfa_status("powered down");
++	}
+ }
+ 
+ static void
+@@ -521,37 +557,35 @@ au_tone_poll(vm_offset_t abox, unsigned i)
+ 	    au_rd(abox, ABOX_UAIF2_STATUS));
+ }
+ 
+-/* Step 32: RDMA0 -> SPUS OUT0 -> SIFS1 -> UAIF2 with a 1 kHz tone; step 64 turns the amplifier on meanwhile. */
++struct au_maps {
++	vm_offset_t top, dispaud, abox, pmu, gpio;
++};
++
++static bool
++au_map_path(struct au_maps *m)
++{
++	m->top = ml_io_map(CMU_TOP_PA, 0x4000);
++	m->dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
++	m->abox = ml_io_map(ABOX_PA, 0x4000);
++	m->pmu = ml_io_map(PMU_PA + 0x3000, 0x1000);
++	m->gpio = ml_io_map(GPIO_DISPAUD_PA, 0x1000);
++	return m->top && m->dispaud && m->abox && m->pmu && m->gpio;
++}
++
++/*
++ * The speaker's path as xnu23 played it, up to RDMA0 running over bytes at pa (bytes / 2 a period); UAIF2's speaker
++ * output is left off. base_clocks: the audio side's and ABOX's bus clocks too (step 2 of the probe, otherwise).
++ */
+ static void
+-au_tone(void)
++au_path_on(const struct au_maps *m, uint32_t pa, uint32_t bytes, bool base_clocks)
+ {
+-	vm_offset_t top = ml_io_map(CMU_TOP_PA, 0x4000), dispaud = ml_io_map(CMU_DISPAUD_PA, 0x4000);
+-	vm_offset_t abox = ml_io_map(ABOX_PA, 0x4000), pmu = ml_io_map(PMU_PA + 0x3000, 0x1000);
+-	vm_offset_t gpio = ml_io_map(GPIO_DISPAUD_PA, 0x1000), buf = ml_io_map(TONE_PA, TONE_ALLOC);
+-	if (!top || !dispaud || !abox || !pmu || !gpio || !buf) {
+-		printf("A50 AUDIO: tone mapping failed\n");
+-		return;
+-	}
+-	/* Mapped uncached, so ABOX reads what is written here; whole aligned frames, as device memory wants. */
+-	printf("A50 AUDIO: write tone buffer pa %#x, %u bytes next\n", TONE_PA, TONE_BYTES);
+-	au_kick(400);
+-	volatile uint32_t *frames = (volatile uint32_t *)buf;
+-	for (unsigned i = 0; i < TONE_BYTES / 4; i++) {
+-		uint32_t sample = (uint16_t)au_sine[i % 48];
+-		frames[i] = (sample << 16) | sample;
+-	}
+-	__asm__ volatile ("dsb osh" ::: "memory");
+-	uint32_t crest = frames[TONE_CREST_FRAME];
+-	printf("A50 AUDIO: tone buffer frame %u reads %#x, want %#x\n", TONE_CREST_FRAME, crest, TONE_CREST);
+-	if (crest != TONE_CREST) {
+-		printf("A50 AUDIO: tone buffer does not hold what was written, no tone\n");
+-		return;
+-	}
++	vm_offset_t top = m->top, dispaud = m->dispaud, abox = m->abox, pmu = m->pmu, gpio = m->gpio;
+ 
+ 	/* Clocks: the audio side and ABOX's bus (if step 2 did not), UAIF2's BCLK, ABOX's path to DRAM, its GPIO. */
+-	if (!(au_mask & 2)) {
++	if (base_clocks) {
+ 		au_clock_on("TOP GATE_CLKCMU_DISPAUD_AUD", top, 0x2038, 0);
+ 		au_clock_on("ABOX ACLK", dispaud, 0x2020, 0x3014);
++		au_clock_on("SMMU_ABOX", dispaud, 0x20b0, 0x3060);
+ 	}
+ 	au_clock_on("GAT ABOX BCLK_UAIF2", dispaud, 0x2008, 0x3020);
+ 	au_clock_on("GAT RSTNSYNC AUD_UAIF2", dispaud, 0x2018, 0);
+@@ -588,13 +622,42 @@ au_tone(void)
+ 	au_update_logged("ABOX RDMA0_VOL_FACTOR", abox, RDMA0 + RDMA_VOL_FACTOR, 0xffffffu, 0x800000u);
+ 	au_update_logged("ABOX RDMA0_VOL_CHANGE", abox, RDMA0 + RDMA_VOL_CHANGE, 0xffffffu, 0);
+ 	au_update_logged("ABOX RDMA0_CTRL0", abox, RDMA0 + RDMA_CTRL0, 0x70000u, 0);
+-	au_update_logged("ABOX RDMA0_BUF_STR", abox, RDMA0 + RDMA_BUF_STR, ~0xfu, TONE_PA);
+-	au_update_logged("ABOX RDMA0_BUF_END", abox, RDMA0 + RDMA_BUF_END, ~0xfu, TONE_PA + TONE_BYTES);
+-	au_update_logged("ABOX RDMA0_STR_POINT", abox, RDMA0 + RDMA_STR_POINT, ~0xfu, TONE_PA);
+-	au_update_logged("ABOX RDMA0_BUF_OFFSET", abox, RDMA0 + RDMA_BUF_OFFSET, 0xfff0u, TONE_BYTES / 2);
++	au_update_logged("ABOX RDMA0_BUF_STR", abox, RDMA0 + RDMA_BUF_STR, ~0xfu, pa);
++	au_update_logged("ABOX RDMA0_BUF_END", abox, RDMA0 + RDMA_BUF_END, ~0xfu, pa + bytes);
++	au_update_logged("ABOX RDMA0_STR_POINT", abox, RDMA0 + RDMA_STR_POINT, ~0xfu, pa);
++	au_update_logged("ABOX RDMA0_BUF_OFFSET", abox, RDMA0 + RDMA_BUF_OFFSET, 0xfff0u, bytes / 2);
+ 	au_update_logged("ABOX RDMA0_CTRL0", abox, RDMA0 + RDMA_CTRL0,
+ 	    (0xfu << 19) | (0x1fu << 8) | (1u << 13) | (1u << 5) | (1u << 4), (8u << 19) | (0x9u << 8) | (1u << 5));
+ 	au_update_logged("ABOX RDMA0_CTRL0 enable", abox, RDMA0 + RDMA_CTRL0, 1u, 1u);
++}
++
++/* Step 32: RDMA0 -> SPUS OUT0 -> SIFS1 -> UAIF2 with a 1 kHz tone; step 64 turns the amplifier on meanwhile. */
++static void
++au_tone(void)
++{
++	struct au_maps m;
++	vm_offset_t buf = ml_io_map(TONE_PA, TONE_ALLOC);
++	if (!au_map_path(&m) || !buf) {
++		printf("A50 AUDIO: tone mapping failed\n");
++		return;
++	}
++	vm_offset_t abox = m.abox;
++	/* Mapped uncached, so ABOX reads what is written here; whole aligned frames, as device memory wants. */
++	printf("A50 AUDIO: write tone buffer pa %#x, %u bytes next\n", TONE_PA, TONE_BYTES);
++	au_kick(400);
++	volatile uint32_t *frames = (volatile uint32_t *)buf;
++	for (unsigned i = 0; i < TONE_BYTES / 4; i++) {
++		uint32_t sample = (uint16_t)au_sine[i % 48];
++		frames[i] = (sample << 16) | sample;
++	}
++	__asm__ volatile ("dsb osh" ::: "memory");
++	uint32_t crest = frames[TONE_CREST_FRAME];
++	printf("A50 AUDIO: tone buffer frame %u reads %#x, want %#x\n", TONE_CREST_FRAME, crest, TONE_CREST);
++	if (crest != TONE_CREST) {
++		printf("A50 AUDIO: tone buffer does not hold what was written, no tone\n");
++		return;
++	}
++	au_path_on(&m, TONE_PA, TONE_BYTES, !(au_mask & 2));
+ 	au_tone_poll(abox, 0);
+ 	au_update_logged("ABOX UAIF2_CTRL0 SPK_ENABLE", abox, ABOX_UAIF2_CTRL0, 1u, 1u);
+ 	for (unsigned i = 1; i <= 3; i++) {
+@@ -626,6 +689,255 @@ au_tone(void)
+ 	printf("A50 AUDIO: tone done\n");
+ }
+ 
++/*
++ * Step 3 of sound (boot-arg a50sound=1): /dev/hakios-audio, for HakiosAudio.driver in mediaserverd (gpu/hakios-audio,
++ * the S7's plug-in as it is): whole frames of 16-bit stereo at 48 kHz, never waited for (the writer is the HAL's
++ * real-time thread). RDMA0 loops over a ring of 64 KB in ABOX_RMEM all the time; where it reads is RDMA0 STATUS,
++ * OFFSET (28:16) + CNT (12:0) in 16-byte units (xnu23's polls fit that and 48 kHz exactly). A write that (re)starts a
++ * stream lands SOUND_LEAD ahead of that position and the next ones follow on; what would be further ahead than
++ * SOUND_MAX_FILL is dropped. A thread zeroes what has been played, so a stream that stops leaves silence, and keeps
++ * TFA9872 on while there is sound (off SOUND_AMP_IDLE_S after the last sample that was not 0).
++ * Volume: iOS scales the samples itself (the plug-in's control stays at its top; HAKIOS_AUDIO_SET_VOLUME is taken in
++ * 6 dB steps and for mute all the same). There is no speaker protection here (it is ABOX firmware) and xnu23's
++ * -24 dBFS tone was already loud, so everything is as_shift x 6 dB under full scale (a50sound=1: 12 dB).
++ */
++#define SOUND_RING_PA           0xebbe0000u     /* 64 KB of ABOX_RMEM below the tone's buffer */
++#define SOUND_RING_BYTES        0x10000u        /* 341 ms */
++#define SOUND_LEAD              0x1800u         /* 32 ms */
++#define SOUND_MAX_FILL          0x8000u         /* 171 ms */
++#define SOUND_GAP_MS            250u            /* a write this much later than the one before starts over */
++#define SOUND_BUSY_MS           2000u           /* zeroing every 5 ms this long after a write, every 50 ms after */
++#define SOUND_AMP_IDLE_S        10u
++#define SOUND_STATS_S           10u
++
++struct as_volume {
++	uint32_t below;         /* eighths of a dB under the loudest */
++	uint32_t muted;
++};
++#define AS_SET_VOLUME           _IOW('r', 1, struct as_volume)          /* HAKIOS_AUDIO_SET_VOLUME */
++#define AS_PLUGIN_SAYS          _IOW('r', 2, char[200])                 /* the plug-in's words (its stderr goes nowhere) */
++
++static LCK_GRP_DECLARE(as_grp, "a50_sound");
++static LCK_MTX_DECLARE(as_lock, &as_grp);
++static vm_offset_t as_abox, as_ring;
++static volatile bool as_ready;                  /* the path runs, writes go to the ring */
++static volatile bool as_amp_on;
++static volatile bool as_muted;
++static volatile unsigned as_below_shift;        /* HAKIOS_AUDIO_SET_VOLUME, in 6 dB steps */
++static unsigned as_shift = 2;                   /* the cap, in 6 dB steps */
++static uint32_t as_w;                           /* ring offset of the next frame written (as_lock) */
++static volatile uint64_t as_last_write, as_heard;       /* mach times: a write; a sample that was not 0 */
++static uint64_t as_gap_abs, as_busy_abs, as_idle_abs, as_stats_abs;
++static volatile uint64_t as_frames, as_dropped, as_restarts;
++static int as_chan;
++
++static uint32_t
++as_pos(void)
++{
++	uint32_t st = au_rd(as_abox, RDMA0 + RDMA_STATUS);
++	return ((((st >> 16) & 0x1fffu) + (st & 0x1fffu)) * 16u) & (SOUND_RING_BYTES - 1);
++}
++
++static uint64_t
++as_abs_ms(uint64_t ms)
++{
++	uint64_t t;
++	nanoseconds_to_absolutetime(ms * NSEC_PER_MSEC, &t);
++	return t;
++}
++
++static int
++as_open(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	char name[32];
++	proc_selfname(name, (int)sizeof(name));
++	printf("A50 SOUND: /dev/hakios-audio opened by %s\n", name);
++	return 0;
++}
++
++static int
++as_close(__unused dev_t dev, __unused int flags, __unused int devtype, __unused struct proc *p)
++{
++	return 0;
++}
++
++static int
++as_write(__unused dev_t dev, struct uio *uio, __unused int ioflag)
++{
++	uint32_t frames[256];
++	int error = 0;
++	bool loud = false;
++
++	lck_mtx_lock(&as_lock);
++	while (uio_resid(uio) >= 4) {
++		user_ssize_t bytes = uio_resid(uio);
++		bytes = (bytes > (user_ssize_t)sizeof(frames) ? (user_ssize_t)sizeof(frames) : bytes) & ~(user_ssize_t)3;
++		error = uiomove((caddr_t)frames, (int)bytes, uio);
++		if (error) {
++			break;
++		}
++		uint32_t n = (uint32_t)(bytes / 4), done = 0;
++		if (as_ready) {
++			uint64_t now = mach_absolute_time();
++			uint32_t p = as_pos(), fill = (as_w - p) & (SOUND_RING_BYTES - 1);
++			unsigned shift = as_shift + as_below_shift;
++			if (as_last_write == 0 || now - as_last_write > as_gap_abs || fill > SOUND_MAX_FILL) {
++				as_restarts += as_last_write != 0;
++				as_w = (p + SOUND_LEAD) & (SOUND_RING_BYTES - 1);
++				fill = SOUND_LEAD;
++			}
++			while (done < n && fill + 4 <= SOUND_MAX_FILL) {
++				int32_t left = (int16_t)(frames[done] & 0xffffu), right = (int16_t)(frames[done] >> 16);
++				if (as_muted) {
++					left = 0;
++					right = 0;
++				}
++				left >>= shift;
++				right >>= shift;
++				if ((left | right) != 0) {
++					loud = true;
++				}
++				*(volatile uint32_t *)(as_ring + as_w) = (uint32_t)(uint16_t)left | ((uint32_t)(uint16_t)right << 16);
++				as_w = (as_w + 4) & (SOUND_RING_BYTES - 1);
++				fill += 4;
++				done++;
++			}
++			as_last_write = now;
++		}
++		as_frames += done;
++		as_dropped += n - done;
++	}
++	if (loud) {
++		as_heard = mach_absolute_time();
++	}
++	lck_mtx_unlock(&as_lock);
++	if (loud && !as_amp_on) {
++		thread_wakeup(&as_chan);
++	}
++	return error;
++}
++
++static int
++as_ioctl(__unused dev_t dev, u_long command, caddr_t data, __unused int flags, __unused struct proc *p)
++{
++	if (command == AS_SET_VOLUME) {
++		struct as_volume v;
++		memcpy(&v, data, sizeof(v));
++		as_muted = v.muted != 0;
++		as_below_shift = MIN(v.below / 48u, 15u - as_shift);
++		printf("A50 SOUND: volume %u.%u dB under the top%s\n", v.below / 8u, v.below % 8u * 10u / 8u,
++		    v.muted ? ", muted" : "");
++		return 0;
++	}
++	if (command == AS_PLUGIN_SAYS) {
++		data[199] = '\0';
++		printf("A50 SOUND: plug-in: %s", data);
++		return 0;
++	}
++	return ENOTTY;
++}
++
++static const struct cdevsw as_cdevsw = {
++	.d_open = as_open, .d_close = as_close, .d_read = eno_rdwrt, .d_write = as_write,
++	.d_ioctl = as_ioctl, .d_stop = eno_stop, .d_reset = eno_reset, .d_select = eno_select,
++	.d_mmap = eno_mmap, .d_strategy = eno_strat, .d_type = 0
++};
++
++static void
++as_stats(const char *why)
++{
++	printf("A50 SOUND: %s: %llu frames, %llu dropped, %llu restarts; RDMA0 CTRL0 %#x STATUS %#x, UAIF2 CTRL0 %#x "
++	    "STATUS %#x; amplifier %s\n", why, as_frames, as_dropped, as_restarts, au_rd(as_abox, RDMA0 + RDMA_CTRL0),
++	    au_rd(as_abox, RDMA0 + RDMA_STATUS), au_rd(as_abox, ABOX_UAIF2_CTRL0), au_rd(as_abox, ABOX_UAIF2_STATUS),
++	    as_amp_on ? "on" : "off");
++}
++
++static void
++as_thread(__unused void *arg, __unused wait_result_t wr)
++{
++	au_quiet = true;
++	as_gap_abs = as_abs_ms(SOUND_GAP_MS);
++	as_busy_abs = as_abs_ms(SOUND_BUSY_MS);
++	as_idle_abs = as_abs_ms(SOUND_AMP_IDLE_S * 1000ull);
++	as_stats_abs = as_abs_ms(SOUND_STATS_S * 1000ull);
++
++	/* The node first: mediaserverd opens it as it starts (and again on each write until it is there). */
++	int major = cdevsw_add(-1, &as_cdevsw);
++	bool node = false;
++	for (unsigned i = 0; major >= 0 && !node && i < 30; i++) {
++		node = devfs_make_node(makedev(major, 0), DEVFS_CHAR, UID_ROOT, GID_WHEEL, 0666, "hakios-audio") != NULL;
++		if (!node) {
++			au_sleep_ms(1000);
++		}
++	}
++	printf("A50 SOUND: /dev/hakios-audio %s (major %d), %u dB under full scale\n", node ? "made" : "NOT made", major,
++	    as_shift * 6u);
++	if (!node) {
++		return;
++	}
++
++	/* Then the path, as xnu23 played its tone: TFA9872 found (and left powered down), ring zeroed, RDMA0 running. */
++	struct au_maps m;
++	as_ring = ml_io_map(SOUND_RING_PA, SOUND_RING_BYTES);
++	if (!au_map_path(&m) || !as_ring) {
++		printf("A50 SOUND: mapping failed\n");
++		return;
++	}
++	as_abox = m.abox;
++	au_probe_tfa();
++	if (!au_tfa_ok) {
++		printf("A50 SOUND: no TFA9872, no sound\n");
++		return;
++	}
++	for (uint32_t off = 0; off < SOUND_RING_BYTES; off += 4) {
++		*(volatile uint32_t *)(as_ring + off) = 0;
++	}
++	*(volatile uint32_t *)(as_ring + SOUND_RING_BYTES - 4) = TONE_CREST;
++	__asm__ volatile ("dsb osh" ::: "memory");
++	uint32_t check = *(volatile uint32_t *)(as_ring + SOUND_RING_BYTES - 4);
++	*(volatile uint32_t *)(as_ring + SOUND_RING_BYTES - 4) = 0;
++	if (check != TONE_CREST) {
++		printf("A50 SOUND: the ring at %#x does not hold what was written (%#x), no sound\n", SOUND_RING_PA, check);
++		return;
++	}
++	au_path_on(&m, SOUND_RING_PA, SOUND_RING_BYTES, true);
++	au_update_logged("ABOX UAIF2_CTRL0 SPK_ENABLE", as_abox, ABOX_UAIF2_CTRL0, 1u, 1u);
++	uint32_t zeroed = as_pos() & ~3u;
++	as_ready = true;
++	as_stats("ready");
++
++	uint64_t told = mach_absolute_time(), told_frames = 0;
++	for (;;) {
++		/* What RDMA0 has played since the last look: silence, for when no one writes over it. */
++		uint32_t p = as_pos() & ~3u;
++		while (zeroed != p) {
++			*(volatile uint32_t *)(as_ring + zeroed) = 0;
++			zeroed = (zeroed + 4) & (SOUND_RING_BYTES - 1);
++		}
++		uint64_t now = mach_absolute_time(), heard = as_heard, wrote = as_last_write;
++		bool wanted = heard != 0 && now - heard < as_idle_abs;
++		if (wanted && !as_amp_on) {
++			au_tfa_power_up();
++			as_amp_on = true;
++			au_tfa_status("on, for sound");
++		} else if (!wanted && as_amp_on) {
++			au_tfa_power_down();
++			as_amp_on = false;
++			au_tfa_status("off, quiet");
++		}
++		if (now - told > as_stats_abs && as_frames != told_frames) {
++			as_stats("playing");
++			told = now;
++			told_frames = as_frames;
++		}
++		bool busy = as_amp_on || (wrote != 0 && now - wrote < as_busy_abs);
++		uint64_t deadline;
++		clock_interval_to_deadline(busy ? 5 : 50, NSEC_PER_MSEC, &deadline);
++		(void)assert_wait_deadline(&as_chan, THREAD_UNINT, deadline);
++		(void)thread_block(THREAD_CONTINUE_NULL);
++	}
++}
++
+ static void
+ au_probe(__unused void *arg, __unused wait_result_t wr)
+ {
+@@ -670,8 +982,21 @@ au_probe(__unused void *arg, __unused wait_result_t wr)
+ void
+ a50_audio_start(void)
+ {
+-	int on = 0;
++	extern kern_return_t kernel_thread_start_priority(thread_continue_t, void *, integer_t, thread_t *);
++	int on = 0, sound = 0;
+ 	thread_t thread;
++	/*
++	 * a50sound=1: /dev/hakios-audio, 12 dB under full scale; a50sound=N (6..24): N dB, in 6 dB steps. It sets the same
++	 * hardware up as the probe, so the probe does not run with it.
++	 */
++	PE_parse_boot_argn("a50sound", &sound, sizeof(sound));
++	if (sound) {
++		as_shift = sound == 1 ? 2u : (unsigned)MIN(MAX(sound, 6), 24) / 6u;
++		if (kernel_thread_start_priority(as_thread, NULL, 90, &thread) == KERN_SUCCESS) {
++			thread_deallocate(thread);
++		}
++		return;
++	}
+ 	/*
+ 	 * a50audio=1: every step; otherwise a mask: 1 CMUs, 2 clocks on, 4 ABOX, 8 its SysMMU, 16 CMGP/hsi2c_3/TFA9872,
+ 	 * 32 test tone through ABOX, 64 TFA9872 on during the tone (needs 16).
+diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
+index 95972c2..4b9689f 100644
+--- a/bsd/dev/herolte_drop.c
++++ b/bsd/dev/herolte_drop.c
+@@ -8,7 +8,9 @@
+  *   block 0: "HERODRP1" | u32 version 1 | u32 entry count | u64 bytes | u64 id
+  *   then, from block 1, back to back, 8-byte aligned:
+  *     u32 path length | u32 mode (0 = directory) | u64 size | path | data
+- * Paths are absolute and must start with /private/var/herolte/. Once
++ * Paths are absolute and must start with /private/var/herolte/, or be the
++ * audio plug-in of mediaserverd (HDROP_HAL_DRIVER and what is in it; the
++ * Galaxy A50 has no hero-run to put it there). Once
+  * launchd has remounted the root volume read-write, every entry is written
+  * into it as root:wheel with its mode, unless that package (by id) is
+  * already installed. Boot-arg herodrop=0 skips it.
+@@ -40,6 +42,7 @@ void herolte_drop_apply(void);
+ #define HDROP_BLOCKS    (32768u)                /* 128 MiB */
+ #define HDROP_CHUNK     (256u * HDROP_BLOCK)    /* 1 MiB read at a time */
+ #define HDROP_PREFIX    "/private/var/herolte/"
++#define HDROP_HAL_DRIVER "/System/Library/Audio/Plug-Ins/HAL/HakiosAudio.driver"
+ #define HDROP_MAX_PATH  255u
+ 
+ struct hdrop_header {
+@@ -103,6 +106,20 @@ hdrop_has_dotdot(const char *path)
+ 	return false;
+ }
+ 
++/* Under HDROP_PREFIX, or HDROP_HAL_DRIVER itself and what is in it: nothing else of /System. */
++static bool
++hdrop_allowed(const char *path)
++{
++	size_t hal = strlen(HDROP_HAL_DRIVER);
++	if (hdrop_has_dotdot(path)) {
++		return false;
++	}
++	if (strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) == 0) {
++		return true;
++	}
++	return strncmp(path, HDROP_HAL_DRIVER, hal) == 0 && (path[hal] == '\0' || path[hal] == '/');
++}
++
+ static int
+ hdrop_mkdir(const char *path, int mode, vfs_context_t ctx)
+ {
+@@ -294,7 +311,7 @@ hdrop_install(void)
+ 		uint64_t data = off + ((sizeof(e) + e.path_len + 7) & ~7ull);
+ 		off = data + ((e.size + 7) & ~7ull);
+ 		int error;
+-		if (strncmp(path, HDROP_PREFIX, strlen(HDROP_PREFIX)) != 0 || hdrop_has_dotdot(path)) {
++		if (!hdrop_allowed(path)) {
+ 			error = EPERM;
+ 		} else if (e.mode == 0) {
+ 			error = hdrop_mkdir(path, 0755, ctx);
