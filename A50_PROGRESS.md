@@ -1035,6 +1035,17 @@
   виброотклика — 3,09 с, 148480 кадров, 0 отброшено, 0 перезапусков; TFA9872 сам
   включился (MANSTATE 9) и выключился через 10 с тишины (MANSTATE 10). Вторая
   загрузка: пользователь проверил на слух — **«Звук есть, нормальный»**.
+- **0420 (xnu25): BTAudioHALPlugin убран.** В корне A50 он ещё лежал в
+  `/System/Library/Audio/Plug-Ins/HAL` (видно через `herolte-hfs-read.py ls`), а
+  bluetoothd запрещён `heronoexec` (в логе xnu24 — 20 отказов запуска). На S7 и
+  S9 перенос этого плагина из mediaserverd снизил простой CPU с >300% до <25% из
+  800%. hero-run, который делал это на S7, на A50 нет: теперь ядро
+  (`herolte_drop.c`, поток drop zone, как только корень стал rw — до старта
+  mediaserverd) переименовывает его в `HAL.disabled/BTAudioHALPlugin.driver`
+  через новую обёртку `herolte_rename()` над `renameat_internal` (только A50).
+  Каждую загрузку; уже перенесён — строка `already in HAL.disabled`; boot-arg
+  `a50btaudio=1` возвращает обратно. В логе ядра нет замера загрузки CPU, так что
+  до/после проверяется по плавности и нагреву.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:

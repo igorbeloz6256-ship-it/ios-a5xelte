@@ -1,0 +1,73 @@
+diff --git a/bsd/dev/herolte_drop.c b/bsd/dev/herolte_drop.c
+index 4b9689f..dd399b8 100644
+--- a/bsd/dev/herolte_drop.c
++++ b/bsd/dev/herolte_drop.c
+@@ -234,6 +234,35 @@ hdrop_set_installed_id(uint64_t id, vfs_context_t ctx)
+ 
+ static void hdrop_install(void);
+ 
++#if defined(ARM64_BOARD_CONFIG_A50)
++/*
++ * BTAudioHALPlugin, in mediaserverd, keeps asking for bluetoothd, which heronoexec refuses: on the S7 (hero-run) and
++ * the S9 moving it out of the HAL's folder took idle CPU from over 300% to under 25% of 800%. The Galaxy A50 has no
++ * hero-run, so the kernel moves it to HAL.disabled (where hero-run puts it), every boot before mediaserverd starts;
++ * boot-arg a50btaudio=1 moves it back.
++ */
++int herolte_rename(const char *from, const char *to);      /* bsd/vfs/vfs_syscalls.c */
++
++#define HDROP_HAL_OFF   "/System/Library/Audio/Plug-Ins/HAL.disabled"
++#define HDROP_BT_ON     "/System/Library/Audio/Plug-Ins/HAL/BTAudioHALPlugin.driver"
++#define HDROP_BT_OFF    HDROP_HAL_OFF "/BTAudioHALPlugin.driver"
++
++static void
++hdrop_bt_audio(vfs_context_t ctx)
++{
++	int back = 0;
++	PE_parse_boot_argn("a50btaudio", &back, sizeof(back));
++	(void)hdrop_mkdir(HDROP_HAL_OFF, 0755, ctx);
++	const char *from = back ? HDROP_BT_OFF : HDROP_BT_ON, *to = back ? HDROP_BT_ON : HDROP_BT_OFF;
++	int error = herolte_rename(from, to);
++	if (error == ENOENT) {
++		printf("HEROLTE DROP: BTAudioHALPlugin already %s\n", back ? "in HAL" : "in HAL.disabled");
++	} else {
++		printf("HEROLTE DROP: BTAudioHALPlugin %s: %d\n", back ? "back to HAL" : "moved to HAL.disabled", error);
++	}
++}
++#endif
++
+ /*
+  * The root volume is still read-only when launchd starts (it remounts it
+  * read-write itself; 0240 failed with EROFS), so a thread waits for that
+@@ -247,6 +276,9 @@ hdrop_thread(__unused void *arg, __unused wait_result_t wr)
+ 	for (unsigned i = 0; i < 3000; i++) {           /* up to 5 minutes */
+ 		if (rootvnode != NULLVP && vnode_mount(rootvnode) != NULL &&
+ 		    !vfs_isrdonly(vnode_mount(rootvnode))) {
++#if defined(ARM64_BOARD_CONFIG_A50)
++			hdrop_bt_audio(vfs_context_kernel());
++#endif
+ 			hdrop_install();
+ 			return;
+ 		}
+diff --git a/bsd/vfs/vfs_syscalls.c b/bsd/vfs/vfs_syscalls.c
+index 90e68bb..b375531 100644
+--- a/bsd/vfs/vfs_syscalls.c
++++ b/bsd/vfs/vfs_syscalls.c
+@@ -9705,6 +9705,18 @@ renameat(__unused proc_t p, struct renameat_args *uap, __unused int32_t *retval)
+ 	           uap->tofd, uap->to, UIO_USERSPACE, 0);
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_A50)
++/* For bsd/dev/herolte_drop.c: a rename by absolute kernel paths, as the kernel. */
++int herolte_rename(const char *from, const char *to);
++
++int
++herolte_rename(const char *from, const char *to)
++{
++	return renameat_internal(vfs_context_kernel(), AT_FDCWD, CAST_USER_ADDR_T(from),
++	           AT_FDCWD, CAST_USER_ADDR_T(to), UIO_SYSSPACE, 0);
++}
++#endif
++
+ /*
+  * Make a directory file.
+  *
