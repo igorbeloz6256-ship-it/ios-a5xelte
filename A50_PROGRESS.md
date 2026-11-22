@@ -1026,6 +1026,15 @@
   hal=…\artifact\audio` кладёт `HakiosAudio` (0755) и `Info.plist` (0644).
   mediaserverd грузит плагины при старте: звук — со следующей загрузки после
   установки. Плагин тот же, что у S7 (артефакт mesa-ios, arm64 MH_BUNDLE).
+- **xnu24 на телефоне (2026-11-22): звук iOS работает.** Ядро собралось с
+  первого раза (sha256 `8e5233dc…a0e9`), boot.img `c0b26ecc…8e27`, пакет drop
+  zone 1795359683 (плагин из mesa-ios20) verified. Первая загрузка: `HEROLTE
+  DROP: package 1795359683: 3 entries written` **до** старта mediaserverd, так
+  что плагин заработал сразу: `/dev/hakios-audio opened by mediaserverd`, «the
+  speaker is with the HAL», громкость плагина 0 dB (как у S7), первый звук после
+  виброотклика — 3,09 с, 148480 кадров, 0 отброшено, 0 перезапусков; TFA9872 сам
+  включился (MANSTATE 9) и выключился через 10 с тишины (MANSTATE 10). Вторая
+  загрузка: пользователь проверил на слух — **«Звук есть, нормальный»**.
 - **Вибрация, где ловить** (имена методов из образа корня): ToneLibrary —
   `+[TLAlertSystemSoundController _vibrationPatternForAlert:withSound:]` (узор
   оповещения), `-[TLAlertController stopPlayingAlerts:withOptions:
